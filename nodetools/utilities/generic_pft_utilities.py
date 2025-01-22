@@ -44,7 +44,7 @@ from nodetools.utilities.credentials import CredentialManager
 from nodetools.utilities.exceptions import *
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.utilities.transaction_orchestrator import TransactionOrchestrator
-from nodetools.utilities.transaction_repository import TransactionRepository
+from nodetools.utilities.transaction_repository import TransactionRepository, MemoFilterType
 from nodetools.configuration.configuration import NetworkConfig, NodeConfig, RuntimeConfig
 
 nest_asyncio.apply()
@@ -286,7 +286,8 @@ class GenericPFTUtilities:
         self, 
         account_address: str, 
         pft_only: bool = False, 
-        memo_type_filter: Optional[str] = None
+        memo_type_filter: Optional[str] = None,
+        filter_type: MemoFilterType = MemoFilterType.LIKE
     ) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
@@ -301,7 +302,8 @@ class GenericPFTUtilities:
         results = await self.transaction_repository.get_account_memo_history(
             account_address=account_address,
             pft_only=pft_only,
-            memo_type_filter=memo_type_filter
+            memo_type_filter=memo_type_filter,
+            filter_type=filter_type
         )
 
         df = pd.DataFrame(results)

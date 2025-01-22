@@ -28,5 +28,13 @@ WITH base_query AS (
 SELECT * FROM base_query 
 WHERE 1=1
     AND CASE WHEN $2 THEN pft_amount IS NOT NULL ELSE TRUE END
-    AND CASE WHEN $3::text IS NOT NULL THEN memo_type LIKE $3::text ELSE TRUE END
+    AND CASE 
+        WHEN $3::text IS NOT NULL THEN 
+            CASE 
+                WHEN $4 = 'like' THEN memo_type LIKE $3
+                WHEN $4 = 'regex' THEN memo_type ~ $3
+                ELSE TRUE 
+            END
+        ELSE TRUE 
+    END
 ORDER BY datetime DESC

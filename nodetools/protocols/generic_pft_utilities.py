@@ -7,7 +7,7 @@ from nodetools.configuration.configuration import NetworkConfig, NodeConfig
 from nodetools.configuration.constants import PFTSendDistribution
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
-from nodetools.protocols.transaction_repository import TransactionRepository
+from nodetools.utilities.transaction_repository import TransactionRepository, MemoFilterType
 from nodetools.models.models import MemoGroup
 
 class GenericPFTUtilities(Protocol):
@@ -42,7 +42,8 @@ class GenericPFTUtilities(Protocol):
         self, 
         account_address: str, 
         pft_only: bool = False, 
-        memo_type_filter: Optional[str] = None
+        memo_type_filter: Optional[str] = None,
+        filter_type: MemoFilterType = MemoFilterType.LIKE
     ) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
@@ -50,6 +51,7 @@ class GenericPFTUtilities(Protocol):
             account_address: XRPL account address to get history for
             pft_only: If True, only return transactions with PFT included.
             memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
+            filter_type: MemoFilterType enum specifying whether to use LIKE or regex matching
     
         Returns:
             DataFrame containing transaction history with memo details

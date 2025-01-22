@@ -6,9 +6,14 @@ from nodetools.models.models import MemoTransaction
 import traceback
 import json
 from decimal import Decimal
+from enum import Enum
 
 if TYPE_CHECKING:
     from nodetools.utilities.transaction_orchestrator import ReviewingResult
+
+class MemoFilterType(Enum):
+    LIKE = 'like'
+    REGEX = 'regex'
 
 class TransactionRepository:
     _instance = None
@@ -194,7 +199,8 @@ class TransactionRepository:
         self,
         account_address: str,
         pft_only: bool = False,
-        memo_type_filter: Optional[str] = None
+        memo_type_filter: Optional[str] = None,
+        filter_type: MemoFilterType = MemoFilterType.LIKE
     ) -> List[Dict[str, Any]]:
         """Get transaction history with memos for an account using transaction_memos table.
         
@@ -202,11 +208,11 @@ class TransactionRepository:
             account_address: XRPL account address to get history for
             pft_only: If True, only return transactions with PFT amounts. Defaults to False.
             memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
-            
+            filter_type: MemoFilterType enum specifying whether to use LIKE or regex matching
         Returns:
             List of dictionaries containing transaction history with memo details
         """ 
-        params = [account_address, pft_only, memo_type_filter]
+        params = [account_address, pft_only, memo_type_filter, filter_type.value]
 
         return await self._execute_query(
             query_name='get_account_memo_history',
