@@ -1,4 +1,5 @@
-from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional
+from typing import Protocol, TYPE_CHECKING, List, Dict, Any, Optional, Union
+from nodetools.models.models import MemoTransaction
 from decimal import Decimal
 
 if TYPE_CHECKING:
@@ -9,12 +10,11 @@ class TransactionRepository(Protocol):
 
     async def get_unprocessed_transactions(
         self, 
-        order_by: str = "close_time_iso ASC",
+        order_by: str = "datetime ASC",
         limit: Optional[int] = None,
         include_processed: bool = False
-    ) -> List[Dict[str, Any]]:
-        """
-        Get transactions that haven't been processed yet.
+    ) -> List[MemoTransaction]:
+        """Get transactions that haven't been processed yet.
         
         Args:
             order_by: SQL ORDER BY clause
@@ -46,7 +46,7 @@ class TransactionRepository(Protocol):
     async def execute_query(
         self,
         query: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Union[Dict[str, Any], List[Any]]] = None,
         enforce_column_structure: bool = False
     ) -> List[Dict[str, Any]]:
         """
@@ -54,9 +54,9 @@ class TransactionRepository(Protocol):
         
         Args:
             query: SQL query string
-            params: Optional dictionary of query parameters
+            params: Optional dictionary of query parameters or list of parameters
             enforce_column_structure: If True, enforce the column structure of the query, 
-                otherwise empty results will return None
+                otherwise empty results will return None. 
                 Useful when placing results into a pandas dataframe that requires a consistent structure
             
         Returns:
@@ -64,8 +64,15 @@ class TransactionRepository(Protocol):
         """
         ...
     
-    async def insert_transaction(self, tx_message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Insert a single transaction and return the processed record"""
+    async def insert_transaction(self, tx: Dict[str, Any]) -> Optional[MemoTransaction]:
+        """Insert a single transaction and return the processed record.
+        
+        Args:
+            tx: Transaction dictionary to insert
+            
+        Returns:
+            Optional[MemoTransaction]: Processed record if found, None if not found
+        """
         ...
 
     async def get_decoded_memo(self, tx_hash: str) -> Optional[Dict[str, Any]]:
@@ -79,14 +86,14 @@ class TransactionRepository(Protocol):
         """
         ...
 
-    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[Dict[str, Any]]:
+    async def get_decoded_memo_w_processing(self, tx_hash: str) -> Optional[MemoTransaction]:
         """Get a specific transaction with decoded memos and processing results by hash.
         
         Args:
             tx_hash: The transaction hash to look up
             
         Returns:
-            Dict containing transaction data with decoded memos if found, None otherwise
+            MemoTransaction object with decoded memos and processing results if found, None otherwise
         """
         ...
 
@@ -116,16 +123,44 @@ class TransactionRepository(Protocol):
         """
         ...
 
+    async def deauthorize_addresses(
+        self,
+        auth_source: str,
+        auth_source_user_id: str
+    ) -> None:
+        """Deauthorize all addresses for a given auth source user.
+        
+        Args:
+            auth_source: Source of authorization (e.g. 'discord', 'twitter')
+            auth_source_user_id: User ID from the auth source
+        """
+        ...
+
     async def flag_address(
         self,
         address: str,
         flag_type: str,
+        yellow_flag_hours: int = 24,
+        red_flag_hours: int = 240
     ) -> None:
         """Flag an address with either YELLOW or RED flag status.
         
         Args:
             address: XRPL address to flag
             flag_type: Either 'YELLOW' or 'RED'
+            yellow_flag_hours: Number of hours for a yellow flag
+            red_flag_hours: Number of hours for a red flag
+        """
+        ...
+
+    async def clear_address_flags(
+        self,
+        address: str,
+    ) -> None:
+        """Clear all flags for a specific address, regardless of expiration status.
+        
+        Args:
+            address: XRPL address to clear flags for
         """
         ...
 
@@ -142,6 +177,17 @@ class TransactionRepository(Protocol):
             
         Returns:
             bool: True if user has active flags, False otherwise
+        """
+        ...
+
+    async def get_associated_addresses(self, address: str) -> list[str]:
+        """Get all addresses associated with the same auth_source_user_id as the given address.
+        
+        Args:
+            address: Any XRPL address belonging to the user
+            
+        Returns:
+            list[str]: List of all addresses associated with the same user
         """
         ...
 

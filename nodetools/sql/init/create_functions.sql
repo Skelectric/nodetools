@@ -1,11 +1,8 @@
-DROP TRIGGER IF EXISTS process_tx_memos_trigger ON postfiat_tx_cache;
-DROP TRIGGER IF EXISTS update_pft_holders_trigger ON transaction_memos;
-DROP FUNCTION IF EXISTS find_transaction_response(text, text, timestamp, text, text, text, boolean);
-
+-- Function to find a response to a request transaction
 CREATE OR REPLACE FUNCTION find_transaction_response(
     request_account TEXT,      -- Account that made the request
     request_destination TEXT,  -- Destination account of the request
-    request_time TEXT,         -- Timestamp of the request
+    request_time TIMESTAMP,    -- Timestamp of the request
     response_memo_type TEXT,   -- Expected memo_type of the response
     response_memo_format TEXT DEFAULT NULL,  -- Optional: expected memo_format
     response_memo_data TEXT DEFAULT NULL,    -- Optional: expected memo_data
@@ -17,36 +14,37 @@ CREATE OR REPLACE FUNCTION find_transaction_response(
     memo_type TEXT,
     memo_format TEXT,
     memo_data TEXT,
-    transaction_result VARCHAR(255),
-    close_time_iso TIMESTAMP
+    transaction_result VARCHAR(50),
+    datetime TIMESTAMP
 ) AS $$
 BEGIN
     RETURN QUERY
     SELECT 
-        d.hash::VARCHAR(255),
-        (d.tx_json_parsed->>'Account')::VARCHAR(255) as account,
-        (d.tx_json_parsed->>'Destination')::VARCHAR(255) as destination,
-        d.memo_type,
-        d.memo_format,
-        d.memo_data,
-        d.transaction_result::VARCHAR(255),
-        d.close_time_iso::timestamp
-    FROM decoded_memos d
+        tm.hash,
+        tm.account,
+        tm.destination,
+        tm.memo_type,
+        tm.memo_format,
+        tm.memo_data,
+        tm.transaction_result,
+        tm.datetime
+    FROM transaction_memos tm
     WHERE 
-        d.tx_json_parsed->>'Destination' = request_account
-        AND d.transaction_result = 'tesSUCCESS'
+        tm.destination = request_account
+        AND tm.transaction_result = 'tesSUCCESS'
         AND (
             NOT require_after_request 
-            OR d.close_time_iso::timestamp > request_time::timestamp
+            OR tm.datetime > request_time
         )
-        AND d.memo_type = response_memo_type
-        AND (response_memo_format IS NULL OR d.memo_format = response_memo_format)
-        AND (response_memo_data IS NULL OR d.memo_data LIKE response_memo_data)
-    ORDER BY d.close_time_iso ASC
+        AND tm.memo_type LIKE response_memo_type
+        AND (response_memo_format IS NULL OR tm.memo_format = response_memo_format)
+        AND (response_memo_data IS NULL OR tm.memo_data LIKE response_memo_data)
+    ORDER BY tm.datetime ASC
     LIMIT 1;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Function to decode hex-encoded memos
 CREATE OR REPLACE FUNCTION decode_hex_memo(memo_text TEXT) 
 RETURNS TEXT AS $$
 BEGIN
@@ -60,6 +58,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Function to process raw transaction data and insert into transaction_memos
 CREATE OR REPLACE FUNCTION process_tx_memos() 
 RETURNS TRIGGER AS $$
 BEGIN
@@ -104,11 +103,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
-CREATE TRIGGER process_tx_memos_trigger
-    AFTER INSERT OR UPDATE ON postfiat_tx_cache
-    FOR EACH ROW
-    EXECUTE FUNCTION process_tx_memos();
 
 -- Function to update PFT holders and balances when transactions are processed
 CREATE OR REPLACE FUNCTION update_pft_holders()
@@ -177,9 +171,3 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create trigger
-CREATE TRIGGER update_pft_holders_trigger
-    AFTER INSERT ON transaction_memos
-    FOR EACH ROW
-    EXECUTE FUNCTION update_pft_holders();

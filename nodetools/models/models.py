@@ -1,11 +1,14 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Set, Optional, Dict, Any, Pattern, TYPE_CHECKING, List
+from dataclasses import dataclass, asdict
+from typing import Set, Optional, Dict, Any, Pattern, TYPE_CHECKING, List, Union
 from enum import Enum
 from loguru import logger
 from decimal import Decimal
-from xrpl.models import Memo
 import re
+from datetime import datetime as dt
+import copy
+from xrpl.models import Memo
+from nodetools.configuration.constants import MEMO_VERSION
 
 if TYPE_CHECKING:
     from nodetools.protocols.credentials import CredentialManager
@@ -13,19 +16,7 @@ if TYPE_CHECKING:
     from nodetools.protocols.openrouter import OpenRouterTool
     from nodetools.protocols.transaction_repository import TransactionRepository
     from nodetools.protocols.encryption import MessageEncryption
-    from nodetools.protocols.db_manager import DBConnectionManager
     from nodetools.configuration.configuration import NodeConfig, NetworkConfig
-
-class InteractionType(Enum):
-    REQUEST = "request"
-    RESPONSE = "response"
-    STANDALONE = "standalone"
-
-class MemoDataStructureType(Enum):
-    ECDH = "e"      # Encryption
-    BROTLI = "b"    # Compression
-    CHUNK = "c"     # Chunking
-    NONE = "-"      # No processing
 
 @dataclass
 class Dependencies:
@@ -38,49 +29,151 @@ class Dependencies:
     transaction_repository: 'TransactionRepository'
     message_encryption: 'MessageEncryption'
 
+class InteractionType(Enum):
+    REQUEST = "request"
+    RESPONSE = "response"
+    STANDALONE = "standalone"
+
+class MemoDataStructureType(Enum):
+    """Components of the standardized memo format"""
+    VERSION = "v"   # Version prefix
+    ECDH = "e"      # Encryption
+    BROTLI = "b"    # Compression
+    CHUNK = "c"     # Chunking
+    NONE = "-"      # No processing
+
+@dataclass
+class MemoTransaction:
+    """
+    Represents a transaction with a memo
+    Corresponds to the transaction_memos + transaction_processing_results tables
+    """
+    hash: str
+    account: str
+    destination: str
+    pft_amount: Decimal
+    xrp_fee: Decimal
+    memo_type: str
+    memo_format: str
+    memo_data: str
+    datetime: dt
+    transaction_result: str
+    processed: Optional[bool] = None
+    rule_name: Optional[str] = None
+    response_tx_hash: Optional[str] = None
+    notes: Optional[str] = None
+    reviewed_at: Optional[dt] = None
+
+    def __post_init__(self):
+        """Ensure proper initialization of fields"""
+        if self.pft_amount is None:
+            self.pft_amount = Decimal('0')
+        elif isinstance(self.pft_amount, (int, str, float)):
+            self.pft_amount = Decimal(str(self.pft_amount))
+
+        if isinstance(self.xrp_fee, (int, str, float)):
+            self.xrp_fee = Decimal(str(self.xrp_fee))
+
+        if isinstance(self.datetime, str):
+            self.datetime = dt.fromisoformat(self.datetime)
+        elif not isinstance(self.datetime, dt):
+            raise TypeError(f"datetime must be datetime object or ISO format string, got: {type(self.datetime)}")
+        
+        if self.memo_type is None:
+            raise ValueError("memo_type is required")
+        
+        if self.memo_format is None:
+            raise ValueError("memo_format is required")
+        
+        if self.memo_data is None:
+            raise ValueError("memo_data is required")
+        
+    def copy(self) -> 'MemoTransaction':
+        """Create a deep copy of the MemoTransaction"""
+        return copy.deepcopy(self)
+    
+    def __getitem__(self, key):
+        """Allow dictionary-style access to attributes"""
+        return asdict(self)[key]
+
+    def __iter__(self):
+        """Allow iteration over items"""
+        return iter(asdict(self))
+
+    def keys(self):
+        """Return dictionary keys"""
+        return asdict(self).keys()
+
+    def items(self):
+        """Return dictionary items"""
+        return asdict(self).items()
+
+    def values(self):
+        """Return dictionary values"""
+        return asdict(self).values()
+    
+    def get(self, key, default=None):
+        """Dictionary-style get method with default value"""
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
 @dataclass
 class MemoStructure:
-    """Describes how a memo is structured across transactions"""
-    is_chunked: bool
+    """
+    Describes how a memo is structured across transactions.
+    This is designed to be used for parsing memos from transactions, but not for constructing memo groups.
+    """
+    is_chunked: Optional[bool] = None
     chunk_index: Optional[int] = None
     total_chunks: Optional[int] = None
     group_id: Optional[str] = None
     compression_type: Optional[MemoDataStructureType] = None  # Might be unknown until processing
     encryption_type: Optional[MemoDataStructureType] = None   # Might be unknown until processing
-    is_standardized_format: bool = False  
+    version: Optional[str] = None
+    is_valid_format: bool = False
 
-    @property
-    def is_complete(self) -> bool:
-        """Whether this represents a complete memo"""
-        return not self.is_chunked  # A non-chunked memo is always complete
+    @classmethod
+    def invalid_format(cls) -> 'MemoStructure':
+        """Return an empty MemoStructure, indicating an invalid format"""
+        return cls()
     
     @classmethod
     def is_standardized_memo_format(cls, memo_format: Optional[str]) -> bool:
         """
         Check if memo_format follows the standardized format.
         Examples:
-            "e.b.c1/4"  # encrypted, compressed, chunk 1 of 4
-            "-.b.c2/4"  # not encrypted, compressed, chunk 2 of 4
-            "-.-.-"     # no special processing
+            "v1.0.e.b.c1/4"  # version 1.0, encrypted, compressed, chunk 1 of 4
+            "v1.0.-.b.c2/4"  # version 1.0, not encrypted, compressed, chunk 2 of 4
+            "v1.0.-.-.-"     # version 1.0, no special processing
         """
         if not memo_format:
             return False
         
-        parts = memo_format.split(".")
-        if len(parts) != 3:
+        # Split on the last 3 periods to get [v1.0, e, b, c1/4]
+        parts = memo_format.rsplit(".", 3)
+        if len(parts) != 4:
             return False
         
-        encryption, compression, chunking = parts
+        version, encryption, compression, chunking = parts
 
-        # Validate encryption part
+        # Validate version
+        if not version.startswith(MemoDataStructureType.VERSION.value):
+            return False
+        version_num = version[1:]  # Remove 'v' prefix
+        if version_num != MEMO_VERSION:
+            return False
+
+        # Validate encryption
         if encryption not in {MemoDataStructureType.ECDH.value, MemoDataStructureType.NONE.value}:
             return False
             
-        # Validate compression part
+        # Validate compression
         if compression not in {MemoDataStructureType.BROTLI.value, MemoDataStructureType.NONE.value}:
             return False
             
-        # Validate chunking part
+        # Validate chunking
         if chunking != MemoDataStructureType.NONE.value:
             chunk_match = re.match(fr'{MemoDataStructureType.CHUNK.value}\d+/\d+', chunking)
             if not chunk_match:
@@ -91,20 +184,24 @@ class MemoStructure:
     @classmethod
     def parse_standardized_format(cls, memo_format: str) -> 'MemoStructure':
         """Parse a validated standardized memo_format string."""
-        encryption, compression, chunking = memo_format.split(".")
+        version, encryption, compression, chunking = memo_format.rsplit(".", 3)
+
+        # Parse version
+        version_num = version[1:]  # Remove 'v' prefix and convert to enum
+        version_type = version_num if version_num == MEMO_VERSION else None
 
         # Parse encryption
         encryption_type = (
             MemoDataStructureType.ECDH if encryption == MemoDataStructureType.ECDH.value 
             else None
         )
-        
+
         # Parse compression
         compression_type = (
             MemoDataStructureType.BROTLI if compression == MemoDataStructureType.BROTLI.value 
             else None
         )
-        
+
         # Parse chunking
         chunk_index = None
         total_chunks = None
@@ -113,7 +210,7 @@ class MemoStructure:
             if chunk_match:  # We know this matches from validation
                 chunk_index = int(chunk_match.group(1))
                 total_chunks = int(chunk_match.group(2))
-        
+
         return cls(
             is_chunked=chunk_index is not None,
             chunk_index=chunk_index,
@@ -121,62 +218,30 @@ class MemoStructure:
             group_id=None,  # Will be set from tx
             compression_type=compression_type,
             encryption_type=encryption_type,
-            is_standardized_format=True
+            version=version_type,
+            is_valid_format=True
         )
     
     @classmethod
-    def from_transaction(cls, tx: Dict[str, Any]) -> 'MemoStructure':
+    def from_transaction(cls, tx: MemoTransaction) -> 'MemoStructure':
         """
         Extract memo structure from transaction memo fields.
         
         New format examples:
-            "e.b.c1/4"                    # encrypted, compressed, chunk 1 of 4
-            "-.b.c2/4"                    # not encrypted, compressed, chunk 2 of 4
-            "-.-.-"                       # no special processing
-            "invalid_format"              # Invalid - will fall back to legacy
-        
-        Legacy format example: 
-            memo_data with "chunk_1__" prefix and nested "COMPRESSED__" and "WHISPER__" prefixes
-
-        Legacy format caveats:
-        1. COMPRESSED__ prefix only appears in first chunk
-        2. WHISPER__ prefix only visible after decompression
-        3. Structure might need to be updated after processing
-        
-        Examples:
-            First chunk:  "chunk_1__COMPRESSED__<compressed_data>"
-            Other chunks: "chunk_2__<compressed_data>"
-            After joining and decompressing: "WHISPER__<encrypted_data>"
+            "v1.0.e.b.c1/4"                    # version 1.0, encrypted, compressed, chunk 1 of 4
+            "v1.0.-.b.c2/4"                    # version 1.0, not encrypted, compressed, chunk 2 of 4
+            "v1.0.-.-.-"                       # version 1.0, no special processing
+            "invalid_format"              # Invalid
         """
-        memo_data = tx.get("memo_data", "")
-        memo_format = tx.get("memo_format")
+        memo_format = tx.memo_format
 
         # Check if using standardized format
         if cls.is_standardized_memo_format(memo_format):
             structure = cls.parse_standardized_format(memo_format)
-            structure.group_id = tx.get("memo_type")  # Set group_id from transaction
+            structure.group_id = tx.memo_type  # Set group_id from transaction
             return structure
-
-        ## Backwards compatibility for legacy format
-        # Fall back to legacy prefix detection
-        chunk_match = re.match(r'^chunk_(\d+)__', memo_data)
-        
-        # Only check compression on first chunk
-        is_compressed = (
-            "COMPRESSED__" in memo_data 
-            if chunk_match and chunk_match.group(1) == "1" 
-            else None  # Unknown for other chunks
-        )
-
-        return cls(
-            is_chunked=chunk_match is not None,
-            chunk_index=int(chunk_match.group(1)) if chunk_match else None,
-            total_chunks=None,  # Legacy format doesn't specify total chunks
-            group_id=tx.get("memo_type"),
-            compression_type=MemoDataStructureType.BROTLI if is_compressed else None,
-            encryption_type=None,  # Will be determined after processing
-            is_standardized_format=False
-        )
+        else:
+            return cls.invalid_format()
     
 @dataclass
 class MemoGroup:
@@ -187,17 +252,52 @@ class MemoGroup:
     Additional processing can be applied to the unchunked memo_data.
     """
     group_id: str
-    memos: List[Dict[str, Any]]
+    memos: List[Union[MemoTransaction, Memo]]  # Supports both parsed txs and Memo objects
     structure: Optional[MemoStructure] = None
 
     @classmethod
-    def create_from_transaction(cls, tx: Dict[str, Any]) -> 'MemoGroup':
+    def create_from_transaction(cls, tx: MemoTransaction) -> 'MemoGroup':
         """Create a new message group from an initial transaction"""
         structure = MemoStructure.from_transaction(tx)
         return cls(
-            group_id=tx.get("memo_type"),
+            group_id=tx.memo_type,
             memos=[tx],
             structure=structure,
+        )
+    
+    @classmethod
+    def create_from_memos(cls, memos: List[Memo]) -> 'MemoGroup':
+        """Create a new message group from constructed memos.
+        
+        Raises:
+            ValueError: If memos list is empty or if memos have inconsistent structures
+        """
+        if not memos:
+            raise ValueError("Cannot create MemoGroup from empty memo list")
+            
+        # Get structure from first memo
+        base_structure = MemoStructure.from_transaction(memos[0])
+        group_id = memos[0].memo_type
+        
+        # Validate all memos have consistent structure and group_id
+        for memo in memos[1:]:
+            if memo.memo_type != group_id:
+                raise ValueError(f"Inconsistent group_id: {memo.memo_type} != {group_id}")
+                
+            memo_structure = MemoStructure.from_transaction(memo)
+            if base_structure.is_valid_format:  # Only check consistency for new format messages
+                if not (
+                    memo_structure.is_valid_format and
+                    memo_structure.encryption_type == base_structure.encryption_type and
+                    memo_structure.compression_type == base_structure.compression_type and
+                    memo_structure.total_chunks == base_structure.total_chunks
+                ):
+                    raise ValueError(f"Inconsistent memo structure in group {group_id}")
+
+        return cls(
+            group_id=group_id,
+            memos=memos,
+            structure=base_structure
         )
     
     def _is_structure_consistent(self, new_structure: MemoStructure) -> bool:
@@ -211,21 +311,21 @@ class MemoGroup:
             new_structure.total_chunks == self.structure.total_chunks
         )
     
-    def add_memo(self, tx: Dict[str, Any]) -> bool:
+    def add_memo(self, tx: MemoTransaction) -> bool:
         """
         Add a memo to the group if it belongs.
         Returns True if memo was added, False if it doesn't belong.
         """
-        if tx.get('transaction_result') != 'tesSUCCESS':
+        if tx.transaction_result != 'tesSUCCESS':
             return False
 
-        if tx.get("memo_type") != self.group_id:
+        if tx.memo_type != self.group_id:
             return False
         
         new_structure = MemoStructure.from_transaction(tx)
 
         # For new format messages, validate consistency
-        if new_structure.is_standardized_format:
+        if new_structure.is_valid_format:
             if not self._is_structure_consistent(new_structure):
                 logger.warning(f"Inconsistent message structure in group {self.group_id}")
                 return False
@@ -243,7 +343,7 @@ class MemoGroup:
             
             if existing_memo:
                 # If we found a duplicate chunk, only replace if new tx has earlier datetime
-                if tx.get('datetime') < existing_memo.get('datetime'):
+                if tx.datetime < existing_memo.datetime:
                     self.memos.remove(existing_memo)
                     self.memos.append(tx)
                     return True
@@ -262,32 +362,40 @@ class MemoGroup:
             if MemoStructure.from_transaction(tx).chunk_index is not None
         }
     
+    @property
+    def pft_amount(self) -> Decimal:
+        """Total PFT amount across all transactions in this group"""
+        return sum(
+            (memo.pft_amount for memo in self.memos if isinstance(memo, MemoTransaction)),
+            Decimal(0)
+        )
+    
 class StructuralPattern(Enum):
     """
     Defines patterns for matching XRPL memo structure before content processing.
     Used to determine if memos need grouping and how they should be processed.
     """
-    NO_MEMO = "no_memo"                    # No memo present  
+    # NO_MEMO = "no_memo"                    # No memo present 
     DIRECT_MATCH = "direct_match"          # Can be pattern matched directly
     NEEDS_GROUPING = "needs_grouping"      # New format, needs grouping
-    NEEDS_LEGACY_GROUPING = "needs_legacy_grouping"  # Legacy format, needs grouping
+    INVALID_STRUCTURE = "invalid_structure"  # Invalid structure, cannot be processed
 
     @staticmethod
-    def match(tx: Dict[str, Any]) -> str:
+    def match(tx: MemoTransaction) -> str:
         """Determine how a transaction's memos should be handled"""
-        if not bool(tx.get('has_memos')):
-            return StructuralPattern.NO_MEMO
+
+        # NOTE: This is commented out because unprocessed transactions are queried from the transaction_memos table
+        # and the transaction_memos table only has transactions with memos, so the NO_MEMO case is never hit
+        # if not bool(tx.get('has_memos')):
+        #     return StructuralPattern.NO_MEMO
 
         # Check if there is no memo present
         structure = MemoStructure.from_transaction(tx)
-        if structure.is_standardized_format:
+        if structure.is_valid_format:
             # New format: Use metadata to determine grouping needs
             return StructuralPattern.NEEDS_GROUPING if structure.is_chunked else StructuralPattern.DIRECT_MATCH
         else:
-            # Legacy format: Check for chunk prefix
-            if "chunk_" in tx.get('memo_data', ''):
-                return StructuralPattern.NEEDS_LEGACY_GROUPING
-            return StructuralPattern.DIRECT_MATCH
+            return StructuralPattern.INVALID_STRUCTURE
 
 @dataclass(frozen=True)  # Making it immutable for hashability
 class MemoPattern:
@@ -299,25 +407,22 @@ class MemoPattern:
     memo_format: Optional[str | Pattern] = None
     memo_data: Optional[str | Pattern] = None
 
-    def get_message_structure(self, tx: Dict[str, Any]) -> MemoStructure:
+    def get_message_structure(self, tx: MemoTransaction) -> MemoStructure:
         """Extract structural information from the memo fields"""
         return MemoStructure.from_transaction(tx)
 
-    def matches(self, tx: Dict[str, Any]) -> bool:
+    def matches(self, tx: MemoTransaction) -> bool:
         """Check if a transaction's memo matches this pattern"""
         if self.memo_type:
-            tx_memo_type = tx.get("memo_type")
-            if not tx_memo_type or not self._pattern_matches(self.memo_type, tx_memo_type):
+            if not tx.memo_type or not self._pattern_matches(self.memo_type, tx.memo_type):
                 return False
 
         if self.memo_format:
-            tx_memo_format = tx.get("memo_format")
-            if not tx_memo_format or not self._pattern_matches(self.memo_format, tx_memo_format):
+            if not tx.memo_format or not self._pattern_matches(self.memo_format, tx.memo_format):
                 return False
 
         if self.memo_data:
-            tx_memo_data = tx.get("memo_data")
-            if not tx_memo_data or not self._pattern_matches(self.memo_data, tx_memo_data):
+            if not tx.memo_data or not self._pattern_matches(self.memo_data, tx.memo_data):
                 return False
 
         return True
@@ -398,7 +503,7 @@ class InteractionGraph:
         # Update the reverse lookup
         self.memo_pattern_to_id[memo_pattern] = pattern_id
 
-    def is_valid_response(self, request_pattern_id: str, response_tx: Dict[str, Any]) -> bool:
+    def is_valid_response(self, request_pattern_id: str, response_tx: MemoTransaction) -> bool:
         if request_pattern_id not in self.patterns:
             return False
         
@@ -408,7 +513,7 @@ class InteractionGraph:
 
         return any(resp_pattern.matches(response_tx) for resp_pattern in pattern.valid_responses)
 
-    def find_matching_pattern(self, tx: Dict[str, Any]) -> Optional[str]:
+    def find_matching_pattern(self, tx: MemoTransaction) -> Optional[str]:
         """Find the first pattern ID whose pattern matches the transaction"""
         for pattern_id, pattern in self.patterns.items():
             if pattern.memo_pattern.matches(tx):
@@ -419,13 +524,19 @@ class InteractionGraph:
     def get_pattern_id_by_memo_pattern(self, memo_pattern: MemoPattern) -> Optional[str]:
         """Get the pattern ID for a given memo pattern"""
         return self.memo_pattern_to_id.get(memo_pattern)
+    
+@dataclass
+class ValidationResult:
+    """Result of a validation check"""
+    valid: bool
+    notes: Optional[str] = None
 
 class InteractionRule(ABC):
     """Base class for interaction processing rules"""
     transaction_type: InteractionType
 
     @abstractmethod
-    async def validate(self, tx: Dict[str, Any], *args, **kwargs) -> bool:
+    async def validate(self, tx: MemoTransaction, *args, **kwargs) -> ValidationResult:
         """
         Validate any additional business rules for an interaction
         This is separate from the interaction pattern matching
@@ -445,38 +556,75 @@ class RequestRule(InteractionRule):
     @abstractmethod
     async def validate(
         self,
-        tx: Dict[str, Any],
+        tx: MemoTransaction,
         dependencies: Dependencies
-    ) -> bool:
+    ) -> ValidationResult:
         """Validate transaction against business rules"""
         pass
 
     @abstractmethod
-    async def find_response(self, request_tx: Dict[str, Any]) -> Optional[ResponseQuery]:
+    async def find_response(self, request_tx: MemoTransaction) -> Optional[ResponseQuery]:
         """Get query information for finding a valid response transaction"""
         pass
 
 @dataclass
-class ResponseParameters:
-    """Standardized response parameters for transaction construction"""
+class MemoConstructionParameters:
+    """
+    Parameters for transaction construction.
+    
+    For standardized memos:
+    - memo_type and memo_data are provided directly
+    - memo_format will be constructed during processing
+    
+    For legacy memos:
+    - memo contains the pre-constructed Memo object
+    - memo_type and memo_data should be None
+    """
     source: str  # Name of the address that should send the response
-    memo: Memo  # XRPL memo object
     destination: str  # XRPL destination address
+    memo_type: Optional[str] = None  # Unique group ID for standardized memos
+    memo_data: Optional[str] = None  # Payload for standardized memos
     pft_amount: Optional[Decimal] = None  # Optional PFT amount for the transaction
+    should_encrypt: bool = False  # Whether the memo should be encrypted
+    should_compress: bool = False  # Whether the memo should be compressed
+    should_chunk: bool = False  # Whether the memo should be chunked
+    processed_memo: Optional[Union[Memo, List[Memo]]] = None  # The final XRPL memo after processing
+
+    @classmethod
+    def construct_standardized_memo(
+        cls,
+        source: str,
+        destination: str,
+        memo_data: str,
+        memo_type: str,
+        should_encrypt: bool = False,
+        should_compress: bool = False,
+        pft_amount: Optional[Decimal] = None
+    ) -> 'MemoConstructionParameters':
+        """Create MemoConstructionParameters for a standardized memo."""
+        return cls(
+            source=source,
+            destination=destination,
+            memo_data=memo_data,
+            memo_type=memo_type,
+            should_encrypt=should_encrypt,
+            should_compress=should_compress,
+            pft_amount=pft_amount
+        )
 
 class ResponseGenerator(ABC):
     """Abstract base class defining how to generate a response"""
     @abstractmethod
-    async def evaluate_request(self, request_tx: Dict[str, Any]) -> Dict[str, Any]:
+    async def evaluate_request(self, request_tx: MemoTransaction) -> Dict[str, Any]:
         """Evaluate the request and return response parameters"""
         pass
 
     @abstractmethod
     async def construct_response(
         self, 
-        request_tx: Dict[str, Any],
+        request_tx: MemoTransaction,
         evaluation_result: Dict[str, Any]
-    ) -> ResponseParameters:
+    ) -> MemoConstructionParameters:
         """Construct the response memo and parameters"""
         pass
 

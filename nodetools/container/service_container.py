@@ -195,7 +195,7 @@ class ServiceContainer:
             print(f"\nNo local node configuration available for {network_config.name}")
             RuntimeConfig.HAS_LOCAL_NODE = False
 
-        logger.debug(f"\nInitializing services for {network_config.name}...")
+        logger.debug(f"Initializing services for {network_config.name}...")
         logger.info(
             f"Using {'local' if RuntimeConfig.HAS_LOCAL_NODE else 'public'} endpoints..."
         )

@@ -10,11 +10,13 @@ import asyncio
 import traceback
 import time
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
 # Third party imports
 from loguru import logger
 from xrpl.models import Response
 from cryptography.fernet import InvalidToken
+from tqdm.asyncio import tqdm
 
 # Nodetools imports
 from nodetools.models.models import (
@@ -22,11 +24,13 @@ from nodetools.models.models import (
     InteractionType, 
     InteractionPattern, 
     ResponseGenerator, 
-    ResponseParameters,
+    MemoConstructionParameters,
     Dependencies,
     StructuralPattern,
     MemoGroup,
-    BusinessLogicProvider
+    BusinessLogicProvider,
+    ValidationResult,
+    MemoTransaction
 )
 from nodetools.models.memo_processor import MemoProcessor
 from nodetools.performance.monitor import PerformanceMonitor
@@ -36,7 +40,6 @@ from nodetools.protocols.credentials import CredentialManager
 from nodetools.protocols.openrouter import OpenRouterTool
 from nodetools.protocols.encryption import MessageEncryption
 from nodetools.protocols.xrpl_monitor import XRPLWebSocketMonitor
-from nodetools.protocols.db_manager import DBConnectionManager
 from nodetools.utilities.compression import CompressionError
 from nodetools.configuration.configuration import NodeConfig, NetworkConfig
 from nodetools.configuration.constants import VERIFY_STATE_INTERVAL
@@ -138,32 +141,31 @@ class TransactionReviewer:
             if last_tx_time + self.STALE_GROUP_TIMEOUT < current_time:
                 self.pending_groups.pop(group_id)
 
-    async def review_transaction(self, tx: Dict[str, Any]) -> ReviewingResult:
+    async def review_transaction(self, tx: MemoTransaction) -> ReviewingResult:
         """Review a single transaction against all rules"""
 
         # First determine if transaction needs grouping
         structural_result = StructuralPattern.match(tx)
 
         match structural_result:
-            case StructuralPattern.NO_MEMO:
-                return ReviewingResult(
-                    tx=tx,
-                    processed=True,
-                    rule_name="NoRule",
-                    notes="No memo present"
-                )
+
             case StructuralPattern.DIRECT_MATCH:
                 return await self._review_direct_match(tx)
             
             case StructuralPattern.NEEDS_GROUPING:
-                return await self._review_group(tx, is_standardized=True)
+                return await self._review_group(tx)
             
-            case StructuralPattern.NEEDS_LEGACY_GROUPING:
-                return await self._review_group(tx, is_standardized=False)
+            case StructuralPattern.INVALID_STRUCTURE:
+                return ReviewingResult(
+                    tx=tx,
+                    processed=True,
+                    rule_name="NoRule",
+                    notes="Invalid structure"
+                )
             
-    async def _review_group(self, tx: Dict[str, Any], is_standardized: bool) -> ReviewingResult:
+    async def _review_group(self, tx: MemoTransaction) -> ReviewingResult:
         """Handle review of grouped transactions"""
-        group_id = tx.get('memo_type')
+        group_id = tx.memo_type
 
         # Clean up stale groups
         self._cleanup_stale_groups()
@@ -184,18 +186,18 @@ class TransactionReviewer:
         group = self.pending_groups[group_id]
         structure = group.structure
 
-        # For standardized format, only attempting processing when we have all chunks
-        if is_standardized and len(group.chunk_indices) < structure.total_chunks:
+        # Only attempting processing when we have all chunks
+        if len(group.chunk_indices) < structure.total_chunks:
             return ReviewingResult(
                 tx=tx,
-                processed=False,
+                processed=True,  # This is processed in the context of the individual transaction chunk, not the whole MemoGroup
                 rule_name="NoRule",
                 notes=f"Waiting for more chunks ({len(group.chunk_indices)}/{structure.total_chunks})"
             )
         
         # Try processing the group
         try:
-            processed_content = await MemoProcessor.process_group(
+            processed_content = await MemoProcessor.parse_group(
                 group,
                 credential_manager=self.dependencies.credential_manager,
                 message_encryption=self.dependencies.message_encryption,
@@ -203,25 +205,10 @@ class TransactionReviewer:
             )
             
             # Create synthetic transaction with processed content
-            complete_tx = tx.copy()
-            complete_tx['memo_data'] = processed_content
+            complete_tx: MemoTransaction = tx.copy()
+            complete_tx.memo_data = processed_content
             self.pending_groups.pop(group_id)
             return await self._review_direct_match(complete_tx)
-        
-        except (CompressionError, InvalidToken) as e:
-            # For legacy groups, we lack the metadata to explicitly know if we've received all chunks
-            # So we'll keep the group in pending and try again later if we receive more chunks
-            # Groups in pending are subject to a timeout and will be cleaned up if they're not updated
-            if not is_standardized:
-                return ReviewingResult(
-                    tx=tx,
-                    processed=True,
-                    rule_name="NoRule",
-                    notes=f"Failed to process group (legacy). May be due to missing chunks."
-                )
-            
-            # For standardized format, re-raise to be caught by general exception handler
-            raise
         
         except Exception as e:
             logger.error(f"Error processing group {group_id}: {e}")
@@ -236,7 +223,7 @@ class TransactionReviewer:
                 notes=f"Failed to process group: {str(e)}"
             )
 
-    async def _review_direct_match(self, tx: Dict[str, Any]) -> ReviewingResult:
+    async def _review_direct_match(self, tx: MemoTransaction) -> ReviewingResult:
         """Handle review of transactions that can be matched directly"""
         # First find matching pattern
         pattern_id = self.graph.find_matching_pattern(tx)
@@ -264,7 +251,10 @@ class TransactionReviewer:
 
         try:
 
-            if await rule.validate(tx, dependencies=self.dependencies):  # Pure business rule validation
+            # Business rule validation
+            validation_result: ValidationResult = await rule.validate(tx, dependencies=self.dependencies)
+
+            if validation_result.valid:
 
                 # Process based on the pattern's transaction type
                 match pattern.transaction_type:
@@ -273,13 +263,21 @@ class TransactionReviewer:
 
                         # These transactions don't need processing but might need notification, but only if they're recent.
                         # Normalize the datetime to UTC to check if it's recent
-                        tx_datetime = tx['datetime']
+                        tx_datetime = tx.datetime
                         if isinstance(tx_datetime, datetime) and tx_datetime.tzinfo is None:
                             tx_datetime = tx_datetime.replace(tzinfo=timezone.utc)
 
                         if pattern.notify and self.notification_queue and tx_datetime > (datetime.now(timezone.utc) - timedelta(minutes=1)):
-                            await self.notification_queue.put(tx)
-                            logger.debug(f"TransactionReviewer: Queued notification for transaction {tx['hash']}")
+
+                            # Don't put decrypted payloads into the notification queue
+                            if "[Decrypted]" in tx.memo_data:
+                                undecrypted_tx = tx.copy()
+                                undecrypted_tx.memo_data = "[Encrypted payload]"
+                                await self.notification_queue.put(undecrypted_tx)
+                            else:
+                                await self.notification_queue.put(tx)
+
+                            logger.debug(f"TransactionReviewer: Queued notification for transaction {tx.hash}")
 
                         return ReviewingResult(
                             tx=tx,
@@ -301,10 +299,28 @@ class TransactionReviewer:
                         response_tx = result[0] if result else None
 
                         if not response_tx:
-                            # Request needs processing and might need notification
+                            # Check if this transaction has been reviewed before
+                            existing_result = await self.dependencies.transaction_repository.get_reviewing_result(tx.hash)
+                            if existing_result:
+                                # If it's been reviewed before, mark it as processed to prevent infinite loop
+                                logger.warning(
+                                    f"Transaction {tx.hash} has already been reviewed but no response found. "
+                                    "Marking as processed to prevent duplicate responses. "
+                                    "Ensure that the response-finding query is correct and that the responses are being generated as expected. "
+                                    f"\nQuery used: {response_query.query} "
+                                    f"\nParams used: {response_query.params}"
+                                )
+                                return ReviewingResult(
+                                    tx=tx,
+                                    processed=True,
+                                    rule_name=rule.__class__.__name__,
+                                    notes="Transaction previously reviewed but response not found. Marking as processed to prevent duplicate responses."
+                                )
+
+                            # For first-time reviews, request needs processing and might need notification
                             if pattern.notify and self.notification_queue:
                                 await self.notification_queue.put(tx)
-                                logger.debug(f"TransactionReviewer: Queued notification for transaction {tx['hash']}")
+                                logger.debug(f"TransactionReviewer: Queued notification for transaction {tx.hash}")
 
                             return ReviewingResult(
                                 tx=tx,
@@ -329,7 +345,7 @@ class TransactionReviewer:
                     tx=tx,
                     processed=True,  # We've reviewed it and determined it failed validation
                     rule_name=rule.__class__.__name__,
-                    notes=f"Failed validation for rule {rule.__class__.__name__}"
+                    notes=f"Failed validation for rule {rule.__class__.__name__}: {validation_result.notes}"
                 )
 
         except Exception as e:
@@ -370,8 +386,8 @@ class ResponseQueueRouter:
         self._shutdown_event = shutdown_event
 
         # Track pending responses and their review queues
-        self.pending_responses: Dict[str, Dict[str, Any]] = {}  # tx_hash -> original_tx
-        self.pending_rereviews: Dict[str, Dict[str, Any]] = {}
+        self.pending_responses: Dict[str, MemoTransaction] = {}  # tx_hash -> original_tx
+        self.pending_rereviews: Dict[str, MemoTransaction] = {}
         self.MAX_RETRY_COUNT = 10
         self.RETRY_DELAY = 5  # seconds
 
@@ -395,7 +411,6 @@ class ResponseQueueRouter:
                         pattern=pattern,
                         rule=rule
                     )
-                    logger.debug(f"ResponseQueueRouter: Adding queue config for pattern '{pattern_id}'")
     
         return configs
     
@@ -407,15 +422,15 @@ class ResponseQueueRouter:
         """Get all queue configurations"""
         return self.queue_configs
     
-    async def route_transaction(self, tx: Dict[str, Any]) -> bool:
+    async def route_transaction(self, tx: MemoTransaction) -> bool:
         """Route transaction to appropriate response queue based on its matching rule"""
         try:
 
             # DEBUGGING
-            logger.debug(f"Routing transaction {tx['hash']}")
-            logger.debug(f"Transaction memo_type: {tx.get('memo_type')}")
-            logger.debug(f"Transaction memo_format: {tx.get('memo_format')}")
-            logger.debug(f"Transaction memo_data: {tx.get('memo_data')}")
+            logger.debug(f"Routing transaction {tx.hash}")
+            logger.debug(f"Transaction memo_type: {tx.memo_type}")
+            logger.debug(f"Transaction memo_format: {tx.memo_format}")
+            logger.debug(f"Transaction memo_data: {tx.memo_data}")
 
             result = await self._determine_response_pattern(tx)
 
@@ -423,20 +438,20 @@ class ResponseQueueRouter:
 
             if result.success:
                 # Store original transaction before routing
-                self.pending_responses[tx['hash']] = tx
+                self.pending_responses[tx.hash] = tx
 
                 # Route transaction to appropriate response queue
                 await self.queue_configs[result.pattern_id].queue.put(tx)
-                logger.debug(f"Routed transaction {tx['hash']} to {result.pattern_id} queue")
+                logger.debug(f"Routed transaction {tx.hash} to {result.pattern_id} queue")
                 return True
             return False
 
         except Exception as e:
-            logger.error(f"Error routing transaction {tx['hash']}: {e}")
+            logger.error(f"Error routing transaction {tx.hash}: {e}")
             logger.error(traceback.format_exc())
             return False
         
-    async def _determine_response_pattern(self, tx: Dict[str, Any]) -> ResponseRoutingResult:
+    async def _determine_response_pattern(self, tx: MemoTransaction) -> ResponseRoutingResult:
         """
         Determines which response queue a transaction should be routed to.
         
@@ -510,7 +525,7 @@ class ResponseQueueRouter:
                 for tx_hash, info in list(self.pending_rereviews.items()):
                     if current_time >= info['next_retry']:
                         try:
-                            # Check if specific transaction exists in decoded_memos view
+                            # Check if specific transaction exists in transaction_memos & transaction_processing_results tables
                             tx = await self.transaction_repository.get_decoded_memo_w_processing(tx_hash)
                             logger.debug(f"ResponseQueueRouter: Checking for processed transaction {tx_hash} in database")
                             
@@ -635,7 +650,7 @@ class ResponseProcessor:
                 logger.error(f"BaseConsumer.run: Error processing transaction: {e}")
                 logger.error(traceback.format_exc())
 
-    async def _process_transaction(self, tx: Dict[str, Any]) -> Response:
+    async def _process_transaction(self, tx: MemoTransaction) -> Response:
         """Process a single transaction using the generator"""
         try:
             # Evaluate the request
@@ -644,7 +659,15 @@ class ResponseProcessor:
 
             # Construct response parameters
             logger.debug(f"ResponseProcessor_{self.pattern_id}: Constructing response")
-            response_params: ResponseParameters = await self.generator.construct_response(tx, evaluation)
+            response_params: MemoConstructionParameters = await self.generator.construct_response(tx, evaluation)
+
+            # Construct memo group based on response parameters
+            memo_group = await MemoProcessor.construct_group(
+                memo_params=response_params,
+                credential_manager=self.dependencies.credential_manager,
+                message_encryption=self.dependencies.message_encryption,
+                node_config=self.dependencies.node_config
+            )
 
             # Get appropriate wallet based on source
             node_wallet = self.dependencies.generic_pft_utilities.spawn_wallet_from_seed(
@@ -653,9 +676,9 @@ class ResponseProcessor:
 
             # Send response transaction
             logger.debug(f"ResponseProcessor_{self.pattern_id}: Sending response transaction")
-            return await self.dependencies.generic_pft_utilities.send_memo(
+            return await self.dependencies.generic_pft_utilities.send_memo_group(
                 wallet_seed_or_wallet=node_wallet,
-                memo=response_params.memo,
+                memo_group=memo_group,
                 destination=response_params.destination,
                 pft_amount=response_params.pft_amount
             )
@@ -855,15 +878,13 @@ class TransactionOrchestrator:
                 asyncio.create_task(self.response_manager.retry_pending_reviews(), name="ResponseQueueRouterRetryTask")
             ])
 
-            logger.debug("TransactionOrchestrator: Started all tasks")
-
         except Exception as e:
             logger.error(f"TransactionOrchestrator: Error starting: {e}")
             logger.error(traceback.format_exc())
             raise
     
     def _get_transaction_batches(self, transactions: List[Dict[str, Any]], batch_size: int):
-        """Generate batches of transactions from list."""
+        """Generate batches of raw transactions from list."""
         for start in range(0, len(transactions), batch_size):
             yield transactions[start:start + batch_size]
 
@@ -888,14 +909,23 @@ class TransactionOrchestrator:
         state_sync_stats = StateSyncStats()
 
         log_prefix = "Initial sync" if is_initial_sync else "Periodic sync"
-        logger.info(f"{log_prefix}: Starting PFT state synchronization...")
+        logger.debug(f"{log_prefix}: Starting PFT state synchronization...")
 
         # Get all PFT holder accounts
         trustline_data = await self.generic_pft_utilities.fetch_pft_trustline_data()
         all_accounts = list(trustline_data.keys())
         total_accounts = len(all_accounts)
 
-        logger.info(f"Starting transaction history sync for {total_accounts} accounts")
+        pbar = tqdm(
+            total=total_accounts,
+            desc=f"{log_prefix}: Syncing transaction history",
+            unit="accounts",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} accounts [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+
+        # Add collections for warnings
+        missed_transactions = []  # Will store (account, tx_hash, ledger_index) tuples
+        balance_mismatch_warnings = []
 
         for idx, account in enumerate(all_accounts, 1):
             try:
@@ -906,8 +936,8 @@ class TransactionOrchestrator:
                     total_rows_inserted = 0
                     try:
                         for batch in self._get_transaction_batches(tx_hist, batch_size=BATCH_SIZE):
-                            inserted = await self.transaction_repository.batch_insert_transactions(batch)
-                            total_rows_inserted += inserted
+                            inserted_txs = await self.transaction_repository.batch_insert_transactions(batch)
+                            total_rows_inserted += len(inserted_txs)
 
                         if total_rows_inserted > 0:
                             state_sync_stats.transactions_found += total_rows_inserted
@@ -915,10 +945,10 @@ class TransactionOrchestrator:
                             state_sync_stats.rows_inserted += total_rows_inserted
 
                             if not is_initial_sync:
-                                logger.warning(
-                                    f"{log_prefix}: Found {total_rows_inserted} missing transactions "
-                                    f"for account {account} - possible websocket drop"
-                                )
+                                missed_transactions.extend([
+                                    (account, tx['hash'], tx['ledger_index'])
+                                    for tx in inserted_txs
+                                ])
 
                     except Exception as e:
                         logger.error(f"Error in batch insert for account {account}: {e}")
@@ -933,9 +963,8 @@ class TransactionOrchestrator:
                 if db_holder is None:
                     if xrpl_balance != Decimal(0):
                         if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Account {account} has XRPL balance of "
-                                f"{xrpl_balance} PFT but no database record - possible websocket drop"
+                            balance_mismatch_warnings.append(
+                                f"Account {account}: Has XRPL balance of {xrpl_balance} PFT but no database record"
                             )
                         state_sync_stats.balance_mismatches += 1
                         await self.transaction_repository.update_pft_holder(
@@ -948,9 +977,8 @@ class TransactionOrchestrator:
                     db_balance = db_holder['balance']
                     if xrpl_balance != db_balance:
                         if not is_initial_sync:
-                            logger.warning(
-                                f"{log_prefix}: Balance mismatch for account {account}: "
-                                f"XRPL: {xrpl_balance} PFT, Database: {db_balance} PFT - possible websocket drop"
+                            balance_mismatch_warnings.append(
+                                f"Account {account}: XRPL balance {xrpl_balance} PFT != Database balance {db_balance} PFT"
                             )
                         state_sync_stats.balance_mismatches += 1
                         await self.transaction_repository.update_pft_holder(
@@ -962,22 +990,41 @@ class TransactionOrchestrator:
 
                 state_sync_stats.accounts_processed += 1
 
-                # Log progress every 5 accounts
-                if idx % 5 == 0:
-                    progress = (idx / total_accounts) * 100
-                    logger.debug(
-                        f"{log_prefix}: Progress: {progress:.1f}% - "
-                        f"Synced {idx}/{total_accounts} accounts, "
-                        f"{state_sync_stats.rows_inserted} rows inserted"
-                    )
+                pbar.n = idx
+                pbar.set_postfix({
+                    'inserted': state_sync_stats.rows_inserted,
+                    'corrected': state_sync_stats.balances_corrected,
+                }, refresh=True)
                     
             except Exception as e:
                 logger.error(f"{log_prefix}: Error processing account {account}: {e}")
                 logger.error(traceback.format_exc())
                 continue
+
+        pbar.close()
+        print()
+
+        # Log collected warnings after progress bar completes
+        if not is_initial_sync:
+            if missed_transactions:
+                logger.warning(f"{log_prefix}: Detected {len(missed_transactions)} missed transactions:")
+                # Group missed transactions by account for cleaner logging
+                by_account = defaultdict(list)
+                for account, tx_hash, ledger_idx in missed_transactions:
+                    by_account[account].append((tx_hash, ledger_idx))
                 
+                for account, txs in by_account.items():
+                    logger.warning(f"  Account {account}:")
+                    for tx_hash, ledger_idx in sorted(txs, key=lambda x: x[1]):  # Sort by ledger index
+                        logger.warning(f"    - Ledger {ledger_idx}: {tx_hash}")
+            
+            if balance_mismatch_warnings:
+                logger.warning(f"{log_prefix}: Balance mismatches detected:")
+                for warning in balance_mismatch_warnings:
+                    logger.warning(f"  - {warning}")
+
         logger.info(
-            f"{log_prefix}: Completed. Processed {state_sync_stats.accounts_processed}/{total_accounts} "
+            f"{log_prefix}: Processed {state_sync_stats.accounts_processed}/{total_accounts} "
             f"accounts, inserted {state_sync_stats.rows_inserted} rows, "
             f"found {state_sync_stats.transactions_found} new transactions, "
             f"corrected {state_sync_stats.balances_corrected} balances"
@@ -991,15 +1038,31 @@ class TransactionOrchestrator:
         Returns:
             int: Number of transactions queued
         """
-        logger.debug("TransactionOrchestrator: Getting unprocessed transactions")
-        unprocessed_txs = await self.transaction_repository.get_unprocessed_transactions(
-            order_by="close_time_iso ASC",
-            include_processed=False   # Set to True for debugging only
-        )
-        logger.debug(f"TransactionOrchestrator: Found {len(unprocessed_txs)} unprocessed transactions")
+        BATCH_SIZE = 1000
+        offset = 0
+        total_queued = 0
 
-        for tx in unprocessed_txs:
-            await self.review_queue.put(tx)
+        while True:
+            batch = await self.transaction_repository.get_unprocessed_transactions(
+                node_address=self.node_config.node_address,
+                order_by="datetime ASC",
+                include_processed=False,   # Set to True for debugging only
+                offset=offset,
+                limit=BATCH_SIZE
+            )
+            if not batch:
+                break
+            
+            for tx in batch:
+                await self.review_queue.put(tx)
+                total_queued += 1
+
+            if len(batch) < BATCH_SIZE:
+                break
+
+            offset += BATCH_SIZE
+
+        return total_queued
 
     async def _state_sync_loop(self):
         """Handles initial and periodic state synchronization between XRPL and local database"""
@@ -1058,10 +1121,10 @@ class TransactionOrchestrator:
             while not self._shutdown_event.is_set():
                 try:
                     # Wait for next transaction with timeout
-                    tx = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
+                    tx: MemoTransaction = await asyncio.wait_for(self.review_queue.get(), timeout=IDLE_LOG_INTERVAL)
 
                     # Skip invalid transactions
-                    if not tx or not tx.get('hash'):
+                    if not tx or not tx.hash:
                         logger.warning(f"TransactionOrchestrator: Skipping invalid transaction: {tx}")
                         continue
                     
@@ -1072,7 +1135,7 @@ class TransactionOrchestrator:
                     # If transaction needs a response, add to processing queue
                     if not result.processed:
                         unprocessed_count += 1
-                        logger.debug(f"TransactionOrchestrator: Transaction {result.tx['hash']} with memo type {result.tx['memo_type']} needs a response.")
+                        logger.debug(f"TransactionOrchestrator: Transaction {result.tx.hash} with memo type {result.tx.memo_type} needs a response.")
                         await self.routing_queue.put(result.tx)
 
                     # Update counts and handle logging

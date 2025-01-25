@@ -4,9 +4,11 @@ from xrpl.wallet import Wallet
 from xrpl.models import Memo, Response
 from decimal import Decimal
 from nodetools.configuration.configuration import NetworkConfig, NodeConfig
+from nodetools.configuration.constants import PFTSendDistribution
 from nodetools.utilities.db_manager import DBConnectionManager
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
-from nodetools.protocols.transaction_repository import TransactionRepository
+from nodetools.utilities.transaction_repository import TransactionRepository, MemoFilterType
+from nodetools.models.models import MemoGroup
 
 class GenericPFTUtilities(Protocol):
     """Protocol defining the interface for GenericPFTUtilities implementations"""
@@ -36,50 +38,115 @@ class GenericPFTUtilities(Protocol):
         """Get the transaction repository"""
         ...
 
-    async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
-        """Get memo history for a given account"""
+    async def get_account_memo_history(
+        self, 
+        account_address: str, 
+        pft_only: bool = False, 
+        memo_type_filter: Optional[str] = None,
+        filter_type: MemoFilterType = MemoFilterType.LIKE
+    ) -> pd.DataFrame:
+        """Get transaction history with memos for an account.
+        
+        Args:
+            account_address: XRPL account address to get history for
+            pft_only: If True, only return transactions with PFT included.
+            memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
+            filter_type: MemoFilterType enum specifying whether to use LIKE or regex matching
+    
+        Returns:
+            DataFrame containing transaction history with memo details
+        """
+        ...
+
+    async def get_latest_valid_memo_groups(
+        self,
+        memo_history: pd.DataFrame,
+        num_groups: Optional[int] = 1
+    ) -> Optional[Union[MemoGroup, list[MemoGroup]]]:
+        """Get the most recent valid MemoGroup from a set of memo records.
+        This method is designed to process data returned from GenericPFTUtilities.get_account_memo_history.
+        
+        Args:
+            memo_history: DataFrame containing memo records
+            num_groups: Optional int limiting the number of memo groups to return.
+                       If 1 (default), returns a single MemoGroup.
+                       If > 1, returns a list of up to num_groups MemoGroups.
+                       If 0 or None, returns all valid memo groups.
+
+        Returns:
+            Optional[Union[MemoGroup, list[MemoGroup]]]: Most recent valid MemoGroup(s) or None if no valid groups found
+        """
+        ...
+
+    async def send_memo_group(
+        self,
+        wallet_seed_or_wallet: Union[str, Wallet],
+        destination: str,
+        memo_group: MemoGroup,
+        pft_amount: Optional[Decimal] = None,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.FULL_AMOUNT_EACH
+    ) -> Union[Response, list[Response]]:
+        """Send a memo group to a destination
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_group: MemoGroup object containing memos to send
+            pft_amount: Optional total PFT amount to send
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+        
+        Returns:
+            Single Response or list of Responses depending on number of memos
+        """
         ...
 
     async def send_memo(self, 
-            wallet_seed_or_wallet: Union[str, Wallet], 
-            destination: str, 
-            memo: Union[str, Memo], 
-            username: str = None,
-            message_id: str = None,
-            chunk: bool = False,
-            compress: bool = False, 
-            encrypt: bool = False,
-            pft_amount: Optional[Decimal] = None
-        ) -> Union[Response, list[Response]]:
-        """Send a memo to a given account"""
+        wallet_seed_or_wallet: Union[str, Wallet], 
+        destination: str, 
+        memo_data: str, 
+        memo_type: Optional[str] = None,
+        compress: bool = False, 
+        encrypt: bool = False,
+        pft_amount: Optional[Decimal] = None,
+        disable_pft_check: bool = True,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
+    ) -> Union[Response, list[Response]]:
+        """Primary method for sending memos on the XRPL with PFT requirements.
+
+        This method constructs a MemoGroup using the MemoProcessor and sends it via send_memo_group.
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_data: The message content to send
+            memo_type: Message type identifier
+            compress: Whether to compress the memo data (default False)
+            encrypt: Whether to encrypt the memo data (default False)
+            pft_amount: Optional specific PFT amount to send
+            disable_pft_check: Skip PFT requirement check if True
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+
+        Returns:
+            list[dict]: Transaction responses for each chunk sent
+            
+        Raises:
+            ValueError: If wallet input is invalid
+            HandshakeRequiredException: If encryption requested without prior handshake
+        """
         ...
     
     def verify_transaction_response(self, response: Union[Response, list[Response]]) -> bool:
         """Verify a transaction response"""
         ...
 
-    async def get_all_account_compressed_messages(self, account_address: str) -> pd.DataFrame:
-        """Get all compressed messages for a given account"""
-        ...
-
-    def construct_handshake_memo(self, user: str, ecdh_public_key: str) -> str:
-        """Construct a handshake memo"""
-        ...
-
-    def construct_memo(self, memo_data: str, memo_type: str, memo_format: str) -> Memo:
-        """Construct a standardized memo object for XRPL transactions"""
-        ...
-
     def spawn_wallet_from_seed(self, seed: str) -> Wallet:
         """Spawn a wallet from a seed"""
-        ...
-
-    async def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
-        """Get the most recent messages from a user's memo history"""
-        ...
-
-    async def get_all_account_compressed_messages_for_remembrancer(self, account_address: str) -> pd.DataFrame:
-        """Convenience method for getting all messages for a user from the remembrancer's perspective"""
         ...
 
     async def fetch_pft_balance(self, address: str) -> Decimal:
@@ -92,20 +159,6 @@ class GenericPFTUtilities(Protocol):
 
     async def get_pft_balance(self, account_address: str) -> Decimal:
         """Get PFT balance for an account from the database"""
-        ...
-
-    async def process_memo_data(
-        self,
-        memo_type: str,
-        memo_data: str,
-        decompress: bool = True,
-        decrypt: bool = True,
-        full_unchunk: bool = False, 
-        memo_history: Optional[pd.DataFrame] = None,
-        channel_address: Optional[str] = None,
-        channel_counterparty: Optional[str] = None,
-        channel_private_key: Optional[Union[str, Wallet]] = None
-    ) -> str:
         ...
 
     async def verify_xrp_balance(self, address: str, minimum_xrp_balance: int) -> bool:
@@ -134,18 +187,6 @@ class GenericPFTUtilities(Protocol):
         """
         ...
 
-    def extract_transaction_info_from_response_object(self, response) -> dict:
-        """
-        Extract key information from an XRPL transaction response object.
-
-        Args:
-        response (Response): The XRPL transaction response object.
-
-        Returns:
-        dict: A dictionary containing extracted transaction information.
-        """
-        ...
-
     async def send_xrp(
             self,
             wallet_seed_or_wallet: Union[str, Wallet], 
@@ -156,21 +197,26 @@ class GenericPFTUtilities(Protocol):
         ):
         ...
 
-    def extract_transaction_info_from_response_object__standard_xrp(self, response):
+    def extract_transaction_info(self, response) -> dict:
         """
         Extract key information from an XRPL transaction response object.
-        
-        Args:
-        response (Response): The XRPL transaction response object.
-        
-        Returns:
-        dict: A dictionary containing extracted transaction information.
-        """
-        ...
+        Handles both native XRP and issued currency (e.g. PFT) transactions.
 
-    @staticmethod
-    def generate_custom_id():
-        """ Generate a unique memo_type """
+        Args:
+            response (Response): The XRPL transaction response object.
+
+        Returns:
+            dict: A dictionary containing extracted transaction information with keys:
+                - time: Transaction timestamp
+                - amount: Transaction amount
+                - currency: Currency code (XRP or token currency)
+                - send_address: Sender's XRPL address
+                - destination_address: Recipient's XRPL address
+                - status: Transaction status
+                - hash: Transaction hash
+                - xrpl_explorer_url: URL to transaction in XRPL explorer
+                - clean_string: Human-readable transaction summary
+        """
         ...
 
     async def fetch_pft_trustline_data(self, batch_size: int = 200) -> Dict[str, Dict[str, Any]]:

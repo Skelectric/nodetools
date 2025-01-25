@@ -14,6 +14,7 @@ import json
 import traceback
 import asyncio
 import math
+from inspect import signature
 
 # Third party imports
 import nest_asyncio
@@ -32,6 +33,9 @@ from loguru import logger
 # NodeTools imports
 import nodetools.configuration.constants as global_constants
 import nodetools.configuration.configuration as config
+from nodetools.configuration.constants import PFTSendDistribution
+from nodetools.models.models import MemoGroup, MemoConstructionParameters, MemoTransaction
+from nodetools.models.memo_processor import MemoProcessor
 from nodetools.performance.monitor import PerformanceMonitor
 from nodetools.utilities.encryption import MessageEncryption
 from nodetools.utilities.transaction_requirements import TransactionRequirementService
@@ -40,7 +44,7 @@ from nodetools.utilities.credentials import CredentialManager
 from nodetools.utilities.exceptions import *
 from nodetools.utilities.xrpl_monitor import XRPLWebSocketMonitor
 from nodetools.utilities.transaction_orchestrator import TransactionOrchestrator
-from nodetools.utilities.transaction_repository import TransactionRepository
+from nodetools.utilities.transaction_repository import TransactionRepository, MemoFilterType
 from nodetools.configuration.configuration import NetworkConfig, NodeConfig, RuntimeConfig
 
 nest_asyncio.apply()
@@ -269,150 +273,6 @@ class GenericPFTUtilities:
             logger.error(f"Error verifying transaction response: {e}")
             logger.error(traceback.format_exc())
             return False
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def generate_custom_id():
-        """ Generate a unique memo_type """
-        letters = ''.join(random.choices(string.ascii_uppercase, k=2))
-        numbers = ''.join(random.choices(string.digits, k=2))
-        second_part = letters + numbers
-        date_string = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        output= date_string+'__'+second_part
-        output = output.replace(' ',"_")
-        return output
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def decode_xrpl_memo(memo_dict):
-        """Convert hex-encoded memo fields to readable text.
-        
-        Args:
-            memo_dict: Dictionary containing hex-encoded memo fields
-                (MemoFormat, MemoType, MemoData)
-                
-        Returns:
-            dict: Dictionary with decoded text values for each memo field
-        """
-        memo_fields = {
-            'MemoFormat': '',
-            'MemoType': '',
-            'MemoData': ''
-        }
-        
-        for field in memo_fields:
-            try:
-                if field in memo_dict:
-                    memo_fields[field] = GenericPFTUtilities.hex_to_text(memo_dict[field])
-            except Exception as e:
-                logger.debug(f"Failed to decode {field}: {e}")
-                
-        return memo_fields
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def calculate_memo_size(memo_format: str, memo_type: str, memo_data: str) -> dict:
-        """
-        Calculates the size components of a memo using consistent logic.
-        
-        Args:
-            memo_format: The format field (usually username)
-            memo_type: The type field (usually task_id)
-            memo_data: The data field (the actual content)
-            
-        Returns:
-            dict: Size breakdown including:
-                - format_size: Size of hex-encoded format
-                - type_size: Size of hex-encoded type
-                - data_size: Size of hex-encoded data
-                - structural_overhead: Fixed overhead for JSON structure
-                - total_size: Total size including all components
-        """
-        format_size = len(str_to_hex(memo_format))
-        type_size = len(str_to_hex(memo_type))
-        data_size = len(str_to_hex(memo_data))
-        structural_overhead = global_constants.XRP_MEMO_STRUCTURAL_OVERHEAD
-
-        logger.debug(f"Memo size breakdown:")
-        logger.debug(f"  format_size: {format_size}")
-        logger.debug(f"  type_size: {type_size}")
-        logger.debug(f"  data_size: {data_size}")
-        logger.debug(f"  structural_overhead: {structural_overhead}")
-        logger.debug(f"  total_size: {format_size + type_size + data_size + structural_overhead}")
-
-        return {
-            'format_size': format_size,
-            'type_size': type_size,
-            'data_size': data_size,
-            'structural_overhead': structural_overhead,
-            'total_size': format_size + type_size + data_size + structural_overhead
-        }
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def construct_memo(memo_format, memo_type, memo_data, validate_size=False):
-        """Constructs a memo object, checking total size"""
-        # NOTE: This is a hack and appears too conservative
-        # NOTE: We don't know if this is the correct way calculate the XRPL size limits
-        # NOTE: This will raise an error even when a transaction might otherwise succeed
-        if validate_size:
-            size_info = GenericPFTUtilities.calculate_memo_size(memo_format, memo_type, memo_data)
-            if GenericPFTUtilities.is_over_1kb(size_info['total_size']):
-                raise ValueError(f"Memo exceeds 1 KB, raising ValueError: {size_info['total_size']}")
-
-        return Memo(
-            memo_data=GenericPFTUtilities.to_hex(memo_data),
-            memo_type=GenericPFTUtilities.to_hex(memo_type),
-            memo_format=GenericPFTUtilities.to_hex(memo_format)
-        )
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def construct_handshake_memo(user, ecdh_public_key):
-        """Constructs a handshake memo for encrypted communication"""
-        return GenericPFTUtilities.construct_memo(
-            memo_data=ecdh_public_key,
-            memo_type=global_constants.SystemMemoType.HANDSHAKE.value,
-            memo_format=user
-        )
-
-    async def send_xrp(
-            self,
-            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
-            amount: Union[Decimal, int, float], 
-            destination: str, 
-            memo: Memo, 
-            destination_tag: Optional[int] = None
-        ):
-        # Handle wallet input
-        if isinstance(wallet_seed_or_wallet, str):
-            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
-        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
-            wallet = wallet_seed_or_wallet
-        else:
-            logger.error("GenericPFTUtilities.send_xrp: Invalid wallet input, raising ValueError")
-            raise ValueError("Invalid wallet input")
-
-        client = AsyncJsonRpcClient(self.https_url)
-
-        payment = xrpl.models.transactions.Payment(
-            account=wallet.address,
-            amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
-            destination=destination,
-            memos=[memo],
-            destination_tag=destination_tag
-        )
-        try:    
-            response = await submit_and_wait(payment, client, wallet)
-            return response    
-        except xrpl.transaction.XRPLReliableSubmissionException as e:    
-            logger.error(f"GenericPFTUtilities.send_xrp: Transaction submission failed: {e}")
-            logger.error(traceback.format_exc())
-            raise
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.send_xrp: Unexpected error: {e}")
-            logger.error(traceback.format_exc())
-            raise
 
     @staticmethod
     def spawn_wallet_from_seed(seed):
@@ -422,19 +282,28 @@ class GenericPFTUtilities:
         return wallet
     
     @PerformanceMonitor.measure('get_account_memo_history')
-    async def get_account_memo_history(self, account_address: str, pft_only: bool = True) -> pd.DataFrame:
+    async def get_account_memo_history(
+        self, 
+        account_address: str, 
+        pft_only: bool = False, 
+        memo_type_filter: Optional[str] = None,
+        filter_type: MemoFilterType = MemoFilterType.LIKE
+    ) -> pd.DataFrame:
         """Get transaction history with memos for an account.
         
         Args:
             account_address: XRPL account address to get history for
-            pft_only: If True, only return PFT transactions. Defaults to True.
-            
+            pft_only: If True, only return transactions with PFT included.
+            memo_type_filter: Optional string to filter memo_types using LIKE. E.g. '%google_doc_context_link'
+    
         Returns:
             DataFrame containing transaction history with memo details
         """
         results = await self.transaction_repository.get_account_memo_history(
             account_address=account_address,
-            pft_only=pft_only
+            pft_only=pft_only,
+            memo_type_filter=memo_type_filter,
+            filter_type=filter_type
         )
 
         df = pd.DataFrame(results)
@@ -443,9 +312,74 @@ class GenericPFTUtilities:
         df['datetime'] = pd.to_datetime(df['datetime'])
         return df
     
-    def is_encrypted(self, memo: str):
-        """Check if a memo is encrypted"""
-        return self.message_encryption.is_encrypted(memo)
+    async def get_latest_valid_memo_groups(
+        self,
+        memo_history: pd.DataFrame,
+        num_groups: Optional[int] = 1
+    ) -> Optional[Union[MemoGroup, list[MemoGroup]]]:
+        """Get the most recent valid MemoGroup from a set of memo records.
+        This method is designed to process data returned from GenericPFTUtilities.get_account_memo_history.
+        
+        Args:
+            memo_history: DataFrame containing memo records
+            num_groups: Optional int limiting the number of memo groups to return.
+                       If 1 (default), returns a single MemoGroup.
+                       If > 1, returns a list of up to num_groups MemoGroups.
+                       If 0 or None, returns all valid memo groups.
+
+        Returns:
+            Optional[Union[MemoGroup, list[MemoGroup]]]: Most recent valid MemoGroup(s) or None if no valid groups found
+        """
+        if memo_history.empty or len(memo_history) == 0:
+            return None
+
+        # Filter for successful transactions
+        filtered_records = memo_history[memo_history['transaction_result'] == "tesSUCCESS"]
+
+        if filtered_records.empty or len(filtered_records) == 0:
+            return None
+        
+        # Get valid MemoTransaction fields
+        valid_fields = set(signature(MemoTransaction).parameters.keys())
+
+        valid_groups = []
+        
+        # Group by memo_type to handle chunked memos
+        for memo_type in filtered_records['memo_type'].unique():
+            try:
+                # Get all transactions for this memo_group
+                group_txs: pd.DataFrame = filtered_records[filtered_records['memo_type'] == memo_type]
+
+                # Convert DataFrame rows to MemoTransaction objects
+                memo_txs = []
+                for tx in group_txs.to_dict(orient='records'):
+                    valid_tx = {k: v for k, v in tx.items() if k in valid_fields}
+                    memo_txs.append(MemoTransaction(**valid_tx))
+
+                # Create and validate MemoGroup
+                memo_group = MemoGroup.create_from_memos(memo_txs)
+
+                # Additional check to ensure we only accept standardized memos
+                if not memo_group.structure or not memo_group.structure.is_valid_format:
+                    # logger.warning(f"Skipping memo group {memo_type} - not using standardized format")
+                    continue
+
+                valid_groups.append(memo_group)
+
+                # Return early if we've reached the desired number of groups
+                if len(valid_groups) == num_groups:
+                    break
+            
+            except ValueError as e:
+                logger.warning(f"Failed to process memo group {memo_type}: {e}")
+                continue
+
+        # If no valid memo groups found, return None
+        if not valid_groups:
+            return None
+        
+        # Return a single MemoGroup if num_groups is 1, otherwise return a list
+        return valid_groups[0] if num_groups == 1 else valid_groups
     
     async def send_handshake(self, wallet_seed: str, destination: str, username: str = None):
         """Sends a handshake memo to establish encrypted communication"""
@@ -469,171 +403,103 @@ class GenericPFTUtilities:
         The channel private key is the wallet secret.
         """
         return self.message_encryption.get_shared_secret(received_public_key, channel_private_key)
-
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def decode_memo_fields_to_dict(memo: Union[xrpl.models.transactions.Memo, dict]):
-        """Decodes hex-encoded XRP memo fields from a dictionary to a more readable dictionary format."""
-        # Handle xrpl.models.transactions.Memo objects
-        if hasattr(memo, 'memo_format'):  # This is a Memo object
-            fields = {
-                'memo_format': memo.memo_format,
-                'memo_type': memo.memo_type,
-                'memo_data': memo.memo_data
-            }
-        else:  # This is a dictionary from transaction JSON
-            fields = {
-                'memo_format': memo.get('MemoFormat', ''),
-                'memo_type': memo.get('MemoType', ''),
-                'memo_data': memo.get('MemoData', '')
-            }
-        
-        return {
-            key: GenericPFTUtilities.hex_to_text(value or '')
-            for key, value in fields.items()
-        }
     
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def calculate_required_chunks(memo: Memo, max_size: int = global_constants.MAX_CHUNK_SIZE) -> int:
-        """
-        Calculates how many chunks will be needed to send a memo.
+    async def send_xrp(
+            self,
+            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
+            amount: Union[Decimal, int, float], 
+            destination: str, 
+            memo_data: Optional[str] = None, 
+            memo_type: Optional[str] = None,
+            compress: bool = False,
+            encrypt: bool = False,
+            destination_tag: Optional[int] = None
+        ) -> Union[Response, list[Response]]:
+        """Send XRP with optional memo processing capabilities.
         
         Args:
-            memo: Original Memo object to analyze
-            max_size: Maximum size in bytes for each complete Memo object
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            amount: Amount of XRP to send
+            destination: XRPL destination address
+            memo_data: Optional memo data to include
+            memo_type: Optional memo type identifier
+            compress: Whether to compress the memo data
+            encrypt: Whether to encrypt the memo data
+            destination_tag: Optional destination tag
             
         Returns:
-            int: Number of chunks required
-            
-        Raises:
-            ValueError: If the memo cannot be chunked (overhead too large)
+            Single Response or list of Responses depending on number of memos
         """
-        # Extract memo components
-        memo_dict = GenericPFTUtilities.decode_memo_fields_to_dict(memo)
-        memo_format = memo_dict['memo_format']
-        memo_type = memo_dict['memo_type']
-        memo_data = memo_dict['memo_data']
+        # Handle wallet input
+        if isinstance(wallet_seed_or_wallet, str):
+            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
+        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
+            wallet = wallet_seed_or_wallet
+        else:
+            logger.error("GenericPFTUtilities.send_xrp: Invalid wallet input, raising ValueError")
+            raise ValueError("Invalid wallet input")
 
-        logger.debug(f"Deconstructed (plaintext) memo sizes: "
-                    f"memo_format: {len(memo_format)}, "
-                    f"memo_type: {len(memo_type)}, "
-                    f"memo_data: {len(memo_data)}")
-
-        # Calculate overhead sizes
-        size_info = GenericPFTUtilities.calculate_memo_size(memo_format, memo_type, "chunk_999__")  # assuming chunk_999__ is worst-case chunk label overhead
-        max_data_size = max_size - size_info['total_size']
-
-        logger.debug(f"Size allocation:")
-        logger.debug(f"  Max size: {max_size}")
-        logger.debug(f"  Total overhead: {size_info['total_size']}")
-        logger.debug(f"  Available for data: {max_size} - {size_info['total_size']} = {max_data_size}")
-
-        if max_data_size <= 0:
-            raise ValueError(
-                f"No space for data: max_size={max_size}, total_overhead={size_info['total_size']}"
+        if not memo_data:
+            return await self._send_memo_single(
+                wallet=wallet,
+                destination=destination,
+                memo=Memo(),  # Empty memo
+                xrp_amount=Decimal(amount),
+                destination_tag=destination_tag
             )
         
-        # Calculate number of chunks needed
-        data_bytes = memo_data.encode('utf-8')
-        required_chunks = math.ceil(len(data_bytes) / max_data_size)
-        required_chunks = 1 if required_chunks == 0 else required_chunks
-        return required_chunks
-    
-    # TODO: Move to MemoBuilder
-    @staticmethod
-    def _chunk_memos(memo: Memo, max_size: int = global_constants.MAX_CHUNK_SIZE) -> List[Memo]:
-        """
-        Splits a Memo object into multiple Memo objects, each under MAX_CHUNK_SIZE bytes.
-        Only chunks the memo_data field while preserving memo_format and memo_type.
-        
-        Args:
-            memo: Original Memo object to split
-            max_size: Maximum size in bytes for each complete Memo object
-            
-        Returns:
-            List of Memo objects, each under max_size bytes
-        """
-        logger.debug("Chunking memo...")
+        params = MemoConstructionParameters.construct_standardized_memo(
+            source=wallet.address,
+            destination=destination,
+            memo_data=memo_data,
+            memo_type=memo_type,
+            should_encrypt=encrypt,
+            should_compress=compress
+        )
 
-        # Extract memo components
-        memo_dict = GenericPFTUtilities.decode_memo_fields_to_dict(memo)
-        memo_format = memo_dict['memo_format']
-        memo_type = memo_dict['memo_type']
-        memo_data = memo_dict['memo_data']
+        memo_group = await MemoProcessor.construct_group_generic(
+            memo_params=params,
+            wallet=wallet,
+            message_encryption=self.message_encryption
+        )
 
-        # Calculate chunks needed and validate size
-        num_chunks = GenericPFTUtilities.calculate_required_chunks(memo, max_size)
-        chunk_size = len(memo_data.encode('utf-8')) // num_chunks
-                
-        # Split into chunks
-        chunked_memos = []
-        data_bytes = memo_data.encode('utf-8')
-        for chunk_number in range(1, num_chunks + 1):
-            start_idx = (chunk_number - 1) * chunk_size
-            end_idx = start_idx + chunk_size if chunk_number < num_chunks else len(data_bytes)
-            chunk = data_bytes[start_idx:end_idx]
-            chunk_with_label = f"chunk_{chunk_number}__{chunk.decode('utf-8', errors='ignore')}"
-
-            # Debug the sizes
-            test_format = str_to_hex(memo_format)
-            test_type = str_to_hex(memo_type)
-            test_data = str_to_hex(chunk_with_label)
-            
-            logger.debug(f"Chunk {chunk_number} sizes:")
-            logger.debug(f"  Plaintext Format size: {len(memo_format)}")
-            logger.debug(f"  Plaintext Type size: {len(memo_type)}")
-            logger.debug(f"  Plaintext Data size: {len(chunk_with_label)}")
-            logger.debug(f"  Plaintext Total size: {len(memo_format) + len(memo_type) + len(chunk_with_label)}")
-            logger.debug(f"  Hex Format size: {len(test_format)}")
-            logger.debug(f"  Hex Type size: {len(test_type)}")
-            logger.debug(f"  Hex Data size: {len(test_data)}")
-            logger.debug(f"  Hex Total size: {len(test_format) + len(test_type) + len(test_data)}")
-            
-            chunk_memo = GenericPFTUtilities.construct_memo(
-                memo_format=memo_format,
-                memo_type=memo_type,
-                memo_data=chunk_with_label,
-                validate_size=False  # TODO: The size validation appears too conservative
-            )
-
-            chunked_memos.append(chunk_memo)
-
-        return chunked_memos
+        return await self.send_memo_group(
+            wallet,
+            destination,
+            memo_group,
+            xrp_amount=Decimal(amount),
+            destination_tag=destination_tag
+        )
 
     async def send_memo(self, 
-            wallet_seed_or_wallet: Union[str, xrpl.wallet.Wallet], 
-            destination: str, 
-            memo: Union[str, Memo], 
-            username: str = None,
-            message_id: str = None,
-            chunk: bool = False,
-            compress: bool = False, 
-            encrypt: bool = False,
-            pft_amount: Optional[Decimal] = None,
-            disable_pft_check: bool = False
-        ) -> Union[Response, list[Response]]:
+        wallet_seed_or_wallet: Union[str, Wallet], 
+        destination: str, 
+        memo_data: str, 
+        memo_type: Optional[str] = None,
+        compress: bool = False, 
+        encrypt: bool = False,
+        pft_amount: Optional[Decimal] = None,
+        disable_pft_check: bool = True,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
+    ) -> Union[Response, list[Response]]:
         """Primary method for sending memos on the XRPL with PFT requirements.
-        
-        This method handles all aspects of memo sending including:
-        - PFT requirement calculation based on destination and memo type
-        - Encryption for secure communication (requires prior handshake) TODO: Move this to a MemoBuilder class
-        - Compression for large messages TODO: Move this to a MemoBuilder class
-        - Automatic chunking for messages exceeding size limits TODO: Move this to a MemoBuilder class
-        - Standardized memo formatting TODO: Move this to a MemoBuilder class
+
+        This method constructs a MemoGroup using the MemoProcessor and sends it via send_memo_group.
         
         Args:
             wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
             destination: XRPL destination address
-            memo: Either a string message or pre-constructed Memo object
-            username: Optional user identifier for memo format field
-            message_id: Optional custom ID for memo type field, auto-generated if None
-            chunk: Whether to chunk the memo data (default False)
+            memo_data: The message content to send
+            memo_type: Message type identifier
             compress: Whether to compress the memo data (default False)
             encrypt: Whether to encrypt the memo data (default False)
-            pft_amount: Optional specific PFT amount to send. If None, amount will be 
-                determined by transaction requirements service.
-                
+            pft_amount: Optional specific PFT amount to send
+            disable_pft_check: Skip PFT requirement check if True
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+
         Returns:
             list[dict]: Transaction responses for each chunk sent
             
@@ -644,23 +510,12 @@ class GenericPFTUtilities:
         # Handle wallet input
         if isinstance(wallet_seed_or_wallet, str):
             wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
-            logged_user = f"{username} ({wallet.address})" if username else wallet.address
-            logger.debug(f"GenericPFTUtilities.send_memo: Spawned wallet for {logged_user} to send memo to {destination}...")
-        elif isinstance(wallet_seed_or_wallet, xrpl.wallet.Wallet):
+            logger.debug(f"GenericPFTUtilities.send_memo: Spawned wallet for {wallet.address} to send memo to {destination}...")
+        elif isinstance(wallet_seed_or_wallet, Wallet):
             wallet = wallet_seed_or_wallet
         else:
             logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
             raise ValueError("Invalid wallet input")
-
-        # Extract memo data, type, and format
-        if isinstance(memo, Memo):
-            memo_data = self.hex_to_text(memo.memo_data)
-            memo_type = self.hex_to_text(memo.memo_type)
-            memo_format = self.hex_to_text(memo.memo_format)
-        else:
-            memo_data = str(memo)
-            memo_type = message_id or self.generate_custom_id()
-            memo_format = username or wallet.classic_address
 
         # TODO: Adopt a spec for PFT requirements
         # Get per-tx PFT requirement
@@ -670,60 +525,101 @@ class GenericPFTUtilities:
                 memo_type=memo_type
             )
 
-        # Check if this is a system memo type
-        is_system_memo = any(
-            memo_type == system_type.value 
-            for system_type in global_constants.SystemMemoType
-        )
-
-        # Handle encryption if requested
-        if encrypt:
-            logger.debug(f"GenericPFTUtilities.send_memo: {username} requested encryption. Checking handshake status.")
-            channel_key, counterparty_key = await self.message_encryption.get_handshake_for_address(wallet.address, destination)
-            if not (channel_key and counterparty_key):
-                raise HandshakeRequiredException(wallet.address, destination)
-            shared_secret = self.message_encryption.get_shared_secret(counterparty_key, wallet.seed)
-            encrypted_memo = self.message_encryption.encrypt_memo(memo_data, shared_secret)
-            memo_data = "WHISPER__" + encrypted_memo
-
-        # Handle compression if requested
-        if compress:
-            logger.debug(f"GenericPFTUtilities.send_memo: {username} requested compression. Compressing memo.")
-            compressed_data = self.compress_string(memo_data)
-            logger.debug(f"GenericPFTUtilities.send_memo: Compressed memo to length {len(compressed_data)}")
-            memo_data = "COMPRESSED__" + compressed_data
-
-        # For system memos, verify size and prevent chunking
-        # construct_memo will raise ValueError if size exceeds limit, since SystemMemoTypes cannot be chunked due to collision risk
-        memo = self.construct_memo(
-            memo_format=memo_format,
-            memo_type=memo_type,
+        # Construct parameters for memo processing
+        params = MemoConstructionParameters.construct_standardized_memo(
+            source=wallet.address,
+            destination=destination,
             memo_data=memo_data,
-            validate_size=(is_system_memo and chunk)
+            memo_type=memo_type,
+            should_encrypt=encrypt,
+            should_compress=compress,
+            pft_amount=pft_amount
         )
 
-        if is_system_memo:
-            return await self._send_memo_single(wallet, destination, memo, pft_amount)
+        # Generate memo group using processor
+        memo_group = await MemoProcessor.construct_group_generic(
+            memo_params=params,
+            wallet=wallet,
+            message_encryption=self.message_encryption
+        )
 
-        # Handle chunking for non-system memos if requested, or if _chunk_memos returns more than one memo
-        chunk_memos = self._chunk_memos(memo)
-        if chunk or len(chunk_memos) > 1:
-            try:
-                responses = []
-
-                for idx, chunk_memo in enumerate(chunk_memos):
-                    logger.debug(f"Sending chunk {idx+1} of {len(chunk_memos)}: {chunk_memo.memo_data[:100]}...")
-                    responses.append(await self._send_memo_single(wallet, destination, chunk_memo, pft_amount))
-
-                return responses
-            except Exception as e:
-                logger.error(f"GenericPFTUtilities.send_memo: Error chunking memo: {e}")
-                logger.error(traceback.format_exc())
-                raise e
+        # Send memo group
+        return await self.send_memo_group(wallet, destination, memo_group, pft_amount, pft_distribution)
+    
+    async def send_memo_group(
+        self,
+        wallet_seed_or_wallet: Union[str, Wallet],
+        destination: str,
+        memo_group: MemoGroup,
+        pft_amount: Optional[Decimal] = None,
+        pft_distribution: PFTSendDistribution = PFTSendDistribution.FULL_AMOUNT_EACH,
+        xrp_amount: Optional[Decimal] = None,
+        destination_tag: Optional[int] = None
+    ) -> Union[Response, list[Response]]:
+        """Send a memo group to a destination
+        
+        Args:
+            wallet_seed_or_wallet: Either a wallet seed string or a Wallet object
+            destination: XRPL destination address
+            memo_group: MemoGroup object containing memos to send
+            pft_amount: Optional total PFT amount to send
+            pft_distribution: Strategy for distributing PFT across chunks:
+                - DISTRIBUTE_EVENLY: Split total amount evenly across all chunks
+                - LAST_CHUNK_ONLY: Send entire amount with last chunk only
+                - FULL_AMOUNT_EACH: Send full amount with each chunk
+            xrp_amount: Optional XRP amount to send (only sent with last chunk)
+            destination_tag: Optional destination tag
+        
+        Returns:
+            Single Response or list of Responses depending on number of memos
+        """
+        # Handle wallet input
+        if isinstance(wallet_seed_or_wallet, str):
+            wallet = self.spawn_wallet_from_seed(wallet_seed_or_wallet)
+        elif isinstance(wallet_seed_or_wallet, Wallet):
+            wallet = wallet_seed_or_wallet
         else:
-            return await self._send_memo_single(wallet, destination, memo, pft_amount)
+            logger.error("GenericPFTUtilities.send_memo: Invalid wallet input, raising ValueError")
+            raise ValueError("Invalid wallet input")
+        
+        responses = []
+        num_memos = len(memo_group.memos)
 
-    async def _send_memo_single(self, wallet: Wallet, destination: str, memo: Memo, pft_amount: Decimal) -> Response:
+        for idx, memo in enumerate(memo_group.memos):
+            # Determine PFT amount for this chunk based on distribution strategy
+            chunk_pft_amount = None
+            match pft_distribution:
+                case PFTSendDistribution.DISTRIBUTE_EVENLY:
+                    chunk_pft_amount = pft_amount / (Decimal(num_memos) if num_memos > 0 else 1)
+                case PFTSendDistribution.LAST_CHUNK_ONLY:
+                    chunk_pft_amount = pft_amount if idx == num_memos - 1 else 0
+                case PFTSendDistribution.FULL_AMOUNT_EACH:
+                    chunk_pft_amount = pft_amount
+
+            # Only send XRP with last chunk
+            chunk_xrp_amount = xrp_amount if idx == num_memos - 1 else None
+
+            logger.debug(f"Sending memo {idx + 1} of {len(memo_group.memos)} from {wallet.address} to {destination}")
+            responses.append(await self._send_memo_single(
+                wallet,
+                destination,
+                memo,
+                chunk_pft_amount,
+                chunk_xrp_amount,
+                destination_tag
+            ))
+
+        return responses if len(memo_group.memos) > 1 else responses[0]
+
+    async def _send_memo_single(
+        self, 
+        wallet: Wallet, 
+        destination: str, 
+        memo: Memo, 
+        pft_amount: Optional[Decimal] = None,
+        xrp_amount: Optional[Decimal] = None,
+        destination_tag: Optional[int] = None
+    ) -> Response:
         """ Sends a single memo to a destination """
         client = AsyncJsonRpcClient(self.https_url)
 
@@ -733,12 +629,17 @@ class GenericPFTUtilities:
             "memos": [memo]
         }
 
-        if pft_amount > 0:
+        if destination_tag is not None:
+            payment_args["destination_tag"] = destination_tag
+
+        if pft_amount and pft_amount > 0:
             payment_args["amount"] = xrpl.models.amounts.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
                 value=str(pft_amount)
             )
+        elif xrp_amount:
+            payment_args["amount"] = xrpl.utils.xrp_to_drops(xrp_amount)
         else:
             # Send minimum XRP amount for memo-only transactions
             payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(global_constants.MIN_XRP_PER_TRANSACTION))
@@ -757,374 +658,6 @@ class GenericPFTUtilities:
             logger.error(f"GenericPFTUtilities._send_memo_single: Unexpected error: {e}")
             logger.error(traceback.format_exc())
             raise
-    
-    def _reconstruct_chunked_message(
-        self,
-        memo_type: str,
-        memo_history: pd.DataFrame
-    ) -> str:
-        """Reconstruct a message from its chunks.
-        
-        Args:
-            memo_type: Message ID to reconstruct
-            memo_history: DataFrame containing memo history
-            account_address: Account address that sent the chunks
-            
-        Returns:
-            str: Reconstructed message or None if reconstruction fails
-        """
-        try:
-            # Get all chunks with this memo type from this account
-            memo_chunks = memo_history[
-                (memo_history['memo_type'] == memo_type) &
-                (memo_history['memo_data'].str.match(r'^chunk_\d+__'))  # Only get actual chunks
-            ].copy()
-
-            if memo_chunks.empty:
-                return None
-            
-            # Extract chunk numbers and sort
-            def extract_chunk_number(x):
-                match = re.search(r'^chunk_(\d+)__', x)
-                return int(match.group(1)) if match else 0
-            
-            memo_chunks['chunk_number'] = memo_chunks['memo_data'].apply(extract_chunk_number)
-            memo_chunks = memo_chunks.sort_values('datetime')
-
-            # Detect and handle multiple chunk sequences
-            # This is to handle the case when a new message is erroneusly sent with an existing message ID
-            current_sequence = []
-            highest_chunk_num = 0
-
-            for _, chunk in memo_chunks.iterrows():
-                # If we see a chunk_1 and already have chunks, this is a new sequence
-                if chunk['chunk_number'] == 1 and current_sequence:
-                    # Check if previous sequence was complete (no gaps)
-                    expected_chunks = set(range(1, highest_chunk_num + 1))
-                    actual_chunks = set(chunk['chunk_number'] for chunk in current_sequence)
-
-                    if expected_chunks == actual_chunks:
-                        # First sequence is complete, ignore all subsequent chunks
-                        # logger.warning(f"GenericPFTUtilities._reconstruct_chunked_message: Found complete sequence for {memo_type}, ignoring new sequence")
-                        break
-                    else:
-                        # First sequence was incomplete, start fresh with new sequence
-                        # logger.warning(f"GenericPFTUtilities._reconstruct_chunked_message: Previous sequence incomplete for {memo_type}, starting new sequence")
-                        current_sequence = []
-                        highest_chunk_num = 0
-
-                current_sequence.append(chunk)
-                highest_chunk_num = max(highest_chunk_num, chunk['chunk_number'])
-
-            # Verify final sequence is complete
-            expected_chunks = set(range(1, highest_chunk_num + 1))
-            actual_chunks = set(chunk['chunk_number'] for chunk in current_sequence)
-            if expected_chunks != actual_chunks:
-                # logger.warning(f"GenericPFTUtilities._reconstruct_chunked_message: Missing chunks for {memo_type}. Expected {expected_chunks}, got {actual_chunks}")
-                return None
-
-            # Combine chunks in order
-            current_sequence.sort(key=lambda x: x['chunk_number'])
-            reconstructed_parts = []
-            for chunk in current_sequence:
-                chunk_data = re.sub(r'^chunk_\d+__', '', chunk['memo_data'])
-                reconstructed_parts.append(chunk_data)
-
-            return ''.join(reconstructed_parts)
-        
-        except Exception as e:
-            # logger.error(f"GenericPFTUtilities._reconstruct_chunked_message: Error reconstructing message {memo_type}: {e}")
-            return None
-
-    async def process_memo_data(
-        self,
-        memo_type: str,
-        memo_data: str,
-        decompress: bool = True,
-        decrypt: bool = True,
-        full_unchunk: bool = False, 
-        memo_history: Optional[pd.DataFrame] = None,
-        channel_address: Optional[str] = None,
-        channel_counterparty: Optional[str] = None,
-        channel_private_key: Optional[Union[str, xrpl.wallet.Wallet]] = None
-    ) -> str:
-        """Process memo data, handling both single and multi-chunk messages.
-        
-        For encrypted messages (WHISPER__ prefix), this method handles decryption using ECDH:
-        
-        Encryption Channel:
-        - An encrypted channel exists between two XRPL addresses (channel_address and channel_counterparty)
-        - To decrypt a message, you need the private key (channel_private_key) corresponding to one end 
-        of the channel (channel_address)
-        - It doesn't matter which end was the sender or receiver - what matters is having 
-        the private key for channel_address, and the public key for channel_counterparty
-        
-        Example Usage:
-        1. When node has the private key:
-            process_memo_data(
-                channel_address=node_address,               # The end we have the private key for
-                channel_counterparty=other_party_address,   # The other end of the channel
-                channel_private_key=node_private_key        # Must correspond to channel_address
-            )
-        
-        2. When we have a user's private key (legacy case):
-            process_memo_data(
-                channel_address=user_address,             # The end we have the private key for
-                channel_counterparty=node_address,        # The other end of the channel
-                channel_private_key=user_private_key      # Must correspond to channel_address
-            )
-
-        Args:
-            memo_type: The memo type to identify related chunks
-            memo_data: Initial memo data string
-            account_address: One end of the encryption channel - MUST correspond to wallet_seed
-            full_unchunk: If True, will attempt to unchunk by referencing memo history
-            decompress: If True, decompresses data if COMPRESSED__ prefix is present
-            decrypt: If True, decrypts data if WHISPER__ prefix is present
-            destination: Required for decryption - the other end of the encryption channel
-            memo_history: Optional pre-filtered memo history for chunk lookup
-            wallet_seed: Required for decryption - MUST be the private key corresponding 
-                        to account_address (not destination)
-        
-        Raises:
-            ValueError: If decrypt=True but wallet_seed is not provided
-            ValueError: If decrypt=True but destination is not provided
-            ValueError: If wallet_seed provided doesn't correspond to account_address
-        """
-        try:
-            processed_data = memo_data
-
-            # Handle chunking
-            if full_unchunk and memo_history is not None:
-
-                # Skip chunk processing for SystemMemoType messages
-                is_system_memo = any(
-                    memo_type == system_type.value 
-                    for system_type in global_constants.SystemMemoType
-                )
-
-                # Handle chunking for non-system messages only
-                if not is_system_memo:
-                    # Check if this is a chunked message
-                    chunk_match = re.match(r'^chunk_\d+__', memo_data)
-                    if chunk_match:
-                        reconstructed = self._reconstruct_chunked_message(
-                            memo_type=memo_type,
-                            memo_history=memo_history
-                        )
-                        if reconstructed:
-                            processed_data = reconstructed
-                        else:
-                            # If reconstruction fails, just clean the prefix from the single message
-                            # logger.warning(f"GenericPFTUtilities.process_memo_data: Reconstruction of chunked message {memo_type} from {channel_address} failed. Cleaning prefix from single message.")
-                            processed_data = re.sub(r'^chunk_\d+__', '', memo_data)
-            
-            elif isinstance(processed_data, str):
-                # Simple chunk prefix removal (no full unchunking)
-                processed_data = re.sub(r'^chunk_\d+__', '', processed_data)
-                
-            # Handle decompression
-            if decompress and processed_data.startswith('COMPRESSED__'):
-                processed_data = processed_data.replace('COMPRESSED__', '', 1)
-                # logger.debug(f"GenericPFTUtilities.process_memo_data: Decompressing data: {processed_data}")
-                try:
-                    processed_data = self.decompress_string(processed_data)
-                except Exception as e:
-                    # logger.warning(f"GenericPFTUtilities.process_memo_data: Error decompressing data: {e}")
-                    return processed_data
-
-            # Handle encryption
-            if decrypt and processed_data.startswith('WHISPER__'):
-                if not all([channel_private_key, channel_counterparty, channel_address]):
-                    logger.warning(
-                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
-                        f"missing required parameters. Need channel_private_key: {bool(channel_private_key)}, "
-                        f"channel_counterparty: {bool(channel_counterparty)}, channel_address: {bool(channel_address)}"
-                    )
-                    return processed_data
-                
-                # Handle wallet object or seed
-                if isinstance(channel_private_key, xrpl.wallet.Wallet):
-                    channel_wallet = channel_private_key
-                    channel_private_key = channel_private_key.seed
-                else:
-                    channel_private_key = channel_private_key
-                    channel_wallet = xrpl.wallet.Wallet.from_seed(channel_private_key)
-                
-                # Validate that the channel_private_key passed to this method corresponds to channel_address
-                if channel_wallet.classic_address != channel_address:
-                    logger.warning(
-                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
-                        f"wallet address derived from channel_private_key {channel_wallet.classic_address} does not match channel_address {channel_address}"
-                    )
-                    return processed_data
-
-                # logger.debug(f"GenericPFTUtilities.process_memo_data: Getting handshake for {channel_address} and {channel_counterparty}")
-                channel_key, counterparty_key = await self.message_encryption.get_handshake_for_address(
-                    channel_address=channel_address,
-                    channel_counterparty=channel_counterparty
-                )
-                if not (channel_key and counterparty_key):
-                    logger.warning(
-                        f"GenericPFTUtilities.process_memo_data: Cannot decrypt message {memo_type} - "
-                        f"no handshake found between {channel_address} and {channel_counterparty}... "
-                        f"channel_key: {channel_key}, counterparty_key: {counterparty_key}"
-                    )
-                    return processed_data
-                
-                # Get the shared secret from the handshake key
-                shared_secret = self.message_encryption.get_shared_secret(
-                    received_public_key=counterparty_key, 
-                    channel_private_key=channel_private_key
-                )
-                # logger.debug(f"GenericPFTUtilities.process_memo_data: Got shared secret for {channel_address} and {channel_counterparty}: {shared_secret}")
-                try:
-                    processed_data = self.message_encryption.process_encrypted_message(processed_data, shared_secret)
-                except Exception as e:
-                    message = (
-                        f"GenericPFTUtilities.process_memo_data: Error decrypting message {memo_type} "
-                        f"between address {channel_address} and counterparty {channel_counterparty}: {processed_data}"
-                    )
-                    logger.error(message)
-                    logger.error(traceback.format_exc())
-                    return f"[Decryption Failed] {processed_data}"
-
-            # logger.debug(f"GenericPFTUtilities.process_memo_data: Decrypted data: {processed_data}")
-                
-            return processed_data
-            
-        except Exception as e:
-            logger.warning(f"GenericPFTUtilities.process_memo_data: Error processing memo {memo_type}: {e}")
-            return processed_data
-        
-    async def get_all_account_compressed_messages_for_remembrancer(
-        self,
-        account_address: str,
-    ) -> pd.DataFrame:
-        """Convenience method for getting all messages for a user from the remembrancer's perspective"""
-        return await self.get_all_account_compressed_messages(
-            account_address=account_address,
-            channel_private_key=self.credential_manager.get_credential(
-                f"{self.node_config.remembrancer_name}__v1xrpsecret"
-            )
-        )
-
-    async def get_all_account_compressed_messages(
-        self,
-        account_address: str,
-        channel_private_key: Optional[Union[str, xrpl.wallet.Wallet]] = None,
-    ) -> pd.DataFrame:
-        """Get all messages for an account, handling chunked messages, compression, and encryption.
-        
-        This method is designed to be called from the node's perspective and handles two scenarios:
-        
-        1. Getting messages for a user's address:
-        - account_address = user's address
-        - channel_counterparty = user's address (for decryption)
-        
-        2. Getting messages for the remembrancer's address:
-        - account_address = remembrancer's address
-        - channel_counterparty = user_account from transaction (for decryption)
-        
-        The method handles:
-        - Message chunking/reconstruction
-        - Compression/decompression
-        - Encryption/decryption using ECDH
-        
-        For encrypted messages, the encryption channel is established between:
-        - One end: remembrancer (whose private key we're using)
-        - Other end: user (either account_address or user_account from transaction)
-        
-        Args:
-            account_address: XRPL account address to get history for
-            channel_private_key: Private key (wallet seed or wallet) for decryption.
-                Required if any messages are encrypted.
-                
-        Returns:
-            DataFrame with columns:
-                - memo_type: Message identifier
-                - processed_message: Decrypted, decompressed, reconstructed message
-                - datetime: Transaction timestamp
-                - direction: INCOMING or OUTGOING relative to account_address
-                - hash: Transaction hash
-                - account: Sender address
-                - destination: Recipient address
-                - pft_amount: Sum of PFT amounts for all chunks
-                
-            Returns empty DataFrame if no messages exist or processing fails.
-        """
-        try:
-            # Get transaction history
-            memo_history = await self.get_account_memo_history(account_address=account_address, pft_only=True)
-
-            if memo_history.empty:
-                return pd.DataFrame()
-
-            # Filter memo_history when getting messages for a user's address
-            if account_address != self.node_config.remembrancer_address:
-                # Scenario 1: Only include memos where remembrancer is involved
-                memo_history = memo_history[
-                    (memo_history['account'] == self.node_config.remembrancer_address) |
-                    (memo_history['destination'] == self.node_config.remembrancer_address)
-                ]
-                
-                if memo_history.empty:
-                    logger.debug(f"No messages found between {account_address} and remembrancer")
-                    return pd.DataFrame()
-
-            # Derive channel_address from channel_private_key
-            if isinstance(channel_private_key, xrpl.wallet.Wallet):
-                channel_address = channel_private_key.classic_address
-            else:
-                channel_address = xrpl.wallet.Wallet.from_seed(channel_private_key).classic_address
-
-            processed_messages = []
-            for msg_id in memo_history['memo_type'].unique():
-
-                msg_txns = memo_history[memo_history['memo_type'] == msg_id]
-                first_txn = msg_txns.iloc[0]
-
-                # Determine channel counterparty based on account_address
-                # If we're getting messages for a user, they are the counterparty
-                # If we're getting messages for the remembrancer, the user_account is the counterparty
-                channel_counterparty = (
-                    account_address 
-                    if account_address != self.node_config.remembrancer_address 
-                    else first_txn['user_account']
-                )
-
-                try:
-                    # Process the message (handles chunking, decompression, and decryption)
-                    processed_message = await self.process_memo_data(
-                        memo_type=msg_id,
-                        memo_data=first_txn['memo_data'],
-                        full_unchunk=True,
-                        memo_history=memo_history,
-                        channel_address=channel_address,
-                        channel_counterparty=channel_counterparty,
-                        channel_private_key=channel_private_key
-                    )
-                except Exception as e:
-                    processed_message = None
-
-                processed_messages.append({
-                    'memo_type': msg_id,
-                    'memo_format': first_txn['memo_format'],
-                    'processed_message': processed_message if processed_message else "[PROCESSING FAILED]",
-                    'datetime': first_txn['datetime'],
-                    'direction': first_txn['direction'],
-                    'hash': first_txn['hash'],
-                    'account': first_txn['account'],
-                    'destination': first_txn['destination'],
-                    'pft_amount': msg_txns['directional_pft'].sum()
-                })
-
-            result_df = pd.DataFrame(processed_messages)
-            return result_df
-        
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_all_account_compressed_messages: Error processing memo data for {account_address}: {e}")
-            return pd.DataFrame()
 
     async def fetch_account_transactions(
             self,
@@ -1347,49 +880,6 @@ class GenericPFTUtilities:
         holder = self.get_pft_holder(account_address)
         return holder['balance'] if holder else Decimal(0)
 
-    async def get_recent_user_memos(self, account_address: str, num_messages: int) -> str:
-        """Get the most recent messages from a user's memo history.
-        
-        Args:
-            account_address: The XRPL account address to fetch messages for
-            num_messages: Number of most recent messages to return (default: 20)
-            
-        Returns:
-            str: JSON string containing datetime-indexed messages
-            
-        Example:
-            >>> get_recent_user_messages("r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n", 10)
-            '{"2024-01-01T12:00:00": "message1", "2024-01-02T14:30:00": "message2", ...}'
-        """
-        try:
-            # Get all messages and select relevant columns
-            df = await self.get_all_account_compressed_messages(
-                account_address=account_address,
-                channel_private_key=self.credential_manager.get_credential(
-                    f"{self.node_config.remembrancer_name}__v1xrpsecret"
-                )
-            )
-
-            if df.empty:
-                logger.debug(f"GenericPFTUtilities.get_recent_user_memos: No memo history found for {account_address}. Returning empty JSON")
-                return json.dumps({})
-        
-            messages_df = df[['processed_message', 'datetime']]
-            
-            # Get most recent messages, sort by time, and convert to JSON
-            recent_messages = (messages_df
-                .tail(num_messages)
-                .sort_values('datetime')
-                .set_index('datetime')['processed_message']
-                .to_json()
-            )
-
-            return recent_messages
-
-        except Exception as e:
-            logger.error(f"GenericPFTUtilities.get_recent_user_memos: Failed to get recent user memos for account {account_address}: {e}")
-            return json.dumps({})
-
     def create_xrp_wallet(self):
         test_wallet = Wallet.create()
         classic_address= test_wallet.classic_address
@@ -1471,90 +961,78 @@ THIS MESSAGE WILL AUTO DELETE IN 60 SECONDS
         """
         balance = await self.fetch_xrp_balance(address)
         return (balance >= minimum_xrp_balance, balance)
-
-    def extract_transaction_info_from_response_object(self, response):
+    
+    def extract_transaction_info(self, response) -> dict:
         """
         Extract key information from an XRPL transaction response object.
+        Handles both native XRP and issued currency (e.g. PFT) transactions.
 
         Args:
-        response (Response): The XRPL transaction response object.
+            response (Response): The XRPL transaction response object.
 
         Returns:
-        dict: A dictionary containing extracted transaction information.
-        """
-        result = response.result
-        tx_json = result['tx_json']
-        
-        # Extract required information
-        url_mask = self.network_config.explorer_tx_url_mask
-        transaction_info = {
-            'time': result['close_time_iso'],
-            'amount': tx_json['DeliverMax']['value'],
-            'currency': tx_json['DeliverMax']['currency'],
-            'send_address': tx_json['Account'],
-            'destination_address': tx_json['Destination'],
-            'status': result['meta']['TransactionResult'],
-            'hash': result['hash'],
-            'xrpl_explorer_url': url_mask.format(hash=result['hash'])
-        }
-        clean_string = (f"Transaction of {transaction_info['amount']} {transaction_info['currency']} "
-                        f"from {transaction_info['send_address']} to {transaction_info['destination_address']} "
-                        f"on {transaction_info['time']}. Status: {transaction_info['status']}. "
-                        f"Explorer: {transaction_info['xrpl_explorer_url']}")
-        transaction_info['clean_string']= clean_string
-        return transaction_info
-
-    def extract_transaction_info_from_response_object__standard_xrp(self, response):
-        """
-        Extract key information from an XRPL transaction response object.
-        
-        Args:
-        response (Response): The XRPL transaction response object.
-        
-        Returns:
-        dict: A dictionary containing extracted transaction information.
+            dict: A dictionary containing extracted transaction information with keys:
+                - time: Transaction timestamp
+                - amount: Transaction amount
+                - currency: Currency code (XRP or token currency)
+                - send_address: Sender's XRPL address
+                - destination_address: Recipient's XRPL address
+                - status: Transaction status
+                - hash: Transaction hash
+                - xrpl_explorer_url: URL to transaction in XRPL explorer
+                - clean_string: Human-readable transaction summary
         """
         transaction_info = {}
         
         try:
+            # Handle different response formats
             result = response.result if hasattr(response, 'result') else response
-            
-            transaction_info['hash'] = result.get('hash')
-            url_mask = self.network_config.explorer_tx_url_mask
-            transaction_info['xrpl_explorer_url'] = url_mask.format(hash=transaction_info['hash'])
-            
             tx_json = result.get('tx_json', {})
-            transaction_info['send_address'] = tx_json.get('Account')
-            transaction_info['destination_address'] = tx_json.get('Destination')
             
-            # Handle different amount formats
-            if 'DeliverMax' in tx_json:
-                transaction_info['amount'] = str(int(tx_json['DeliverMax']) / 1000000)  # Convert drops to XRP
-                transaction_info['currency'] = 'XRP'
-            elif 'Amount' in tx_json:
-                if isinstance(tx_json['Amount'], dict):
-                    transaction_info['amount'] = tx_json['Amount'].get('value')
-                    transaction_info['currency'] = tx_json['Amount'].get('currency')
-                else:
-                    transaction_info['amount'] = str(int(tx_json['Amount']) / 1000000)  # Convert drops to XRP
-                    transaction_info['currency'] = 'XRP'
+            # Extract basic transaction info
+            transaction_info.update({
+                'hash': result.get('hash'),
+                'xrpl_explorer_url': self.network_config.explorer_tx_url_mask.format(hash=result.get('hash')),
+                'send_address': tx_json.get('Account'),
+                'destination_address': tx_json.get('Destination'),
+                'time': result.get('close_time_iso') or tx_json.get('date'),
+                'status': result.get('meta', {}).get('TransactionResult') or result.get('engine_result')
+            })
+
+            # Handle amount and currency based on transaction type
+            amount_info = tx_json.get('DeliverMax') or tx_json.get('Amount')
             
-            transaction_info['time'] = result.get('close_time_iso') or tx_json.get('date')
-            transaction_info['status'] = result.get('meta', {}).get('TransactionResult') or result.get('engine_result')
+            if isinstance(amount_info, dict):
+                # Issued currency (e.g. PFT)
+                transaction_info.update({
+                    'amount': amount_info.get('value'),
+                    'currency': amount_info.get('currency')
+                })
+            elif amount_info:
+                # Native XRP (convert from drops)
+                transaction_info.update({
+                    'amount': str(int(amount_info) / 1_000_000),
+                    'currency': 'XRP'
+                })
             
-            # Create clean string
-            clean_string = (f"Transaction of {transaction_info.get('amount', 'unknown amount')} "
-                            f"{transaction_info.get('currency', 'XRP')} "
-                            f"from {transaction_info.get('send_address', 'unknown sender')} "
-                            f"to {transaction_info.get('destination_address', 'unknown recipient')} "
-                            f"on {transaction_info.get('time', 'unknown time')}. "
-                            f"Status: {transaction_info.get('status', 'unknown')}. "
-                            f"Explorer: {transaction_info['xrpl_explorer_url']}")
+            # Create human-readable summary
+            clean_string = (
+                f"Transaction of {transaction_info.get('amount', 'unknown amount')} "
+                f"{transaction_info.get('currency', 'unknown currency')} "
+                f"from {transaction_info.get('send_address', 'unknown sender')} "
+                f"to {transaction_info.get('destination_address', 'unknown recipient')} "
+                f"on {transaction_info.get('time', 'unknown time')}. "
+                f"Status: {transaction_info.get('status', 'unknown')}. "
+                f"Explorer: {transaction_info['xrpl_explorer_url']}"
+            )
             transaction_info['clean_string'] = clean_string
-            
+
         except Exception as e:
-            transaction_info['error'] = str(e)
-            transaction_info['clean_string'] = f"Error extracting transaction info: {str(e)}"
+            logger.error(f"Error extracting transaction info: {str(e)}")
+            transaction_info.update({
+                'error': str(e),
+                'clean_string': f"Error extracting transaction info: {str(e)}"
+            })
         
         return transaction_info
         
