@@ -247,7 +247,8 @@ class TransactionRepository:
         return results
 
     async def get_unprocessed_transactions(
-        self, 
+        self,
+        node_address: str,
         order_by: str = "datetime ASC",
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -256,6 +257,7 @@ class TransactionRepository:
         """Get transactions that haven't been processed yet.
         
         Args:
+            node_address: XRPL address of the node
             order_by: SQL ORDER BY clause
             limit: Optional limit on number of transactions to return
             offset: Optional offset for pagination
@@ -265,6 +267,7 @@ class TransactionRepository:
             List of MemoTransaction objects
         """
         params = [
+            node_address,
             include_processed,
             order_by,
             offset,

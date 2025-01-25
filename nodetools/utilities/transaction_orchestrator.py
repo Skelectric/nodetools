@@ -1044,6 +1044,7 @@ class TransactionOrchestrator:
 
         while True:
             batch = await self.transaction_repository.get_unprocessed_transactions(
+                node_address=self.node_config.node_address,
                 order_by="datetime ASC",
                 include_processed=False,   # Set to True for debugging only
                 offset=offset,
